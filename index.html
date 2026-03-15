@@ -553,6 +553,11 @@ canvas{width:100%!important;}
         <span>Bootstrapped Zero Curve · Discount Factors · Forward Rates</span>
         <span id="curveSource" class="tag-fallback">FALLBACK</span>
       </div>
+      <div style="font-size:10px;font-family:var(--mono);color:var(--text3);margin-bottom:8px;line-height:1.7;">
+        Rows without a market quote are filled using <strong style="color:var(--purple)">cubic spline interpolation</strong> on bootstrapped zero rates.
+        Points beyond the quoted curve range are <strong style="color:var(--purple)">linearly extrapolated</strong>.
+        &nbsp;|&nbsp; <span class="tag-interp">INTERPOLATED ◈</span> &nbsp; <span style="color:var(--purple);font-size:10px">EXTRAPOLATED ⟿</span>
+      </div>
       <div class="table-wrap">
         <table>
           <thead><tr>
@@ -777,6 +782,132 @@ function bootstrapZeroCurve(quotes) {
   }
 
   return zeros;
+}
+
+// ================================================================
+// CUBIC SPLINE INTERPOLATION (natural spline on zero rates vs t)
+// Used to fill missing standard tenors with interpolated/extrapolated quotes
+// ================================================================
+function buildCubicSpline(xs, ys) {
+  const n = xs.length;
+  if (n < 2) return null;
+  // Set up tridiagonal system for natural cubic spline (M[0]=M[n-1]=0)
+  const h = [], alpha = [], l = [], mu = [], z = [], c = [], b = [], d = [];
+  for (let i = 0; i < n - 1; i++) h[i] = xs[i + 1] - xs[i];
+  for (let i = 1; i < n - 1; i++)
+    alpha[i] = (3 / h[i]) * (ys[i + 1] - ys[i]) - (3 / h[i - 1]) * (ys[i] - ys[i - 1]);
+  l[0] = 1; mu[0] = 0; z[0] = 0;
+  for (let i = 1; i < n - 1; i++) {
+    l[i] = 2 * (xs[i + 1] - xs[i - 1]) - h[i - 1] * mu[i - 1];
+    mu[i] = h[i] / l[i];
+    z[i] = (alpha[i] - h[i - 1] * z[i - 1]) / l[i];
+  }
+  l[n - 1] = 1; z[n - 1] = 0; c[n - 1] = 0;
+  for (let j = n - 2; j >= 0; j--) {
+    c[j] = z[j] - mu[j] * c[j + 1];
+    b[j] = (ys[j + 1] - ys[j]) / h[j] - h[j] * (c[j + 1] + 2 * c[j]) / 3;
+    d[j] = (c[j + 1] - c[j]) / (3 * h[j]);
+  }
+  return { xs, ys, h, b, c, d, n };
+}
+
+function evalCubicSpline(spline, x) {
+  const { xs, ys, b, c, d, n } = spline;
+  // Clamp to range; extrapolate linearly outside
+  if (x <= xs[0]) {
+    // Linear extrapolation from left end using first segment slope
+    return ys[0] + b[0] * (x - xs[0]);
+  }
+  if (x >= xs[n - 1]) {
+    // Linear extrapolation from right end using last segment slope
+    const j = n - 2;
+    const dx = xs[n - 1] - xs[j];
+    const slope = b[j] + 2 * c[j] * dx + 3 * d[j] * dx * dx;
+    return ys[n - 1] + slope * (x - xs[n - 1]);
+  }
+  // Find segment
+  let i = 0;
+  for (let k = 0; k < n - 1; k++) { if (xs[k] <= x && x <= xs[k + 1]) { i = k; break; } }
+  const dx = x - xs[i];
+  return ys[i] + b[i] * dx + c[i] * dx * dx + d[i] * dx * dx * dx;
+}
+
+// ================================================================
+// FILL MISSING STANDARD TENORS via cubic spline on zero rates
+// After bootstrapping known quotes, inject synthetic rows for any
+// standard tenor whose quoted rate was absent from the input.
+// Each injected zero gets .interp = 'interpolated' | 'extrapolated'
+// ================================================================
+const ALL_STANDARD_TENORS = [
+  {tenor:'O/N', t:1/365},
+  {tenor:'1M',  t:1/12},
+  {tenor:'2M',  t:2/12},
+  {tenor:'3M',  t:3/12},
+  {tenor:'6M',  t:0.5},
+  {tenor:'9M',  t:0.75},
+  {tenor:'1Y',  t:1.0},
+  {tenor:'1.5Y',t:1.5},
+  {tenor:'2Y',  t:2.0},
+  {tenor:'2.5Y',t:2.5},
+  {tenor:'3Y',  t:3.0},
+  {tenor:'3.5Y',t:3.5},
+  {tenor:'4Y',  t:4.0},
+  {tenor:'4.5Y',t:4.5},
+  {tenor:'5Y',  t:5.0},
+  {tenor:'6Y',  t:6.0},
+  {tenor:'7Y',  t:7.0},
+  {tenor:'8Y',  t:8.0},
+  {tenor:'9Y',  t:9.0},
+  {tenor:'10Y', t:10.0},
+];
+
+function fillMissingTenors(zeros) {
+  // Build spline on bootstrapped zero (CC) rates
+  const sorted = [...zeros].sort((a, b) => a.t - b.t);
+  const xs = sorted.map(z => z.t);
+  const ys = sorted.map(z => z.z);          // continuously-compounded zero rates
+  const spline = buildCubicSpline(xs, ys);
+  if (!spline) return zeros;
+
+  const tMin = xs[0], tMax = xs[xs.length - 1];
+  const existingT = new Set(sorted.map(z => z.t.toFixed(6)));
+
+  const result = [...sorted];
+
+  ALL_STANDARD_TENORS.forEach(({ tenor, t }) => {
+    // Skip if we already have a bootstrapped point at this t (within tolerance)
+    const alreadyHave = sorted.some(z => Math.abs(z.t - t) < 1e-4);
+    if (alreadyHave) return;
+
+    // Interpolate / extrapolate zero rate
+    const zCC = evalCubicSpline(spline, t);
+    if (!isFinite(zCC) || zCC <= 0) return;
+
+    const dfVal = Math.exp(-zCC * t);
+    // Back out an approximate quoted rate (continuous → simple for ≤1Y, semi-ann otherwise)
+    let quotedRate, type;
+    if (t <= 1.0) {
+      // Simple: DF = 1/(1+r*t) → r = (1/DF - 1)/t
+      quotedRate = (1 / dfVal - 1) / t;
+      type = 'simple';
+    } else {
+      // Semi-annual coupon rate from DF: approximate par rate
+      // We use the spline df for coupon dates
+      let annuity = 0;
+      for (let d = 0.5; d < t - 1e-9; d += 0.5) {
+        const zd = evalCubicSpline(spline, d);
+        annuity += Math.exp(-zd * d);
+      }
+      quotedRate = (1 - dfVal) / (annuity + dfVal) * 2;
+      type = 'semiannual';
+    }
+
+    const kind = t < tMin || t > tMax ? 'extrapolated' : 'interpolated';
+    result.push({ tenor, t, z: zCC, dfVal, quotedRate, type, interp: kind });
+  });
+
+  result.sort((a, b) => a.t - b.t);
+  return result;
 }
 
 // ================================================================
@@ -1742,7 +1873,10 @@ function fmtCr(v) { return fmt2.format(v/1e7); }
 function renderCurveTable(zeros, ct, dealTenor) {
   const tbody=document.getElementById('curveTbody');
   tbody.innerHTML='';
-  const src=isLive?'<span class="tag-live">LIVE ✓</span>':'<span class="tag-fallback">FALLBACK</span>';
+  const srcLive     = '<span class="tag-live">LIVE ✓</span>';
+  const srcFallback = '<span class="tag-fallback">FALLBACK</span>';
+  const srcInterp   = '<span class="tag-interp" style="font-size:10px">INTERPOLATED ◈</span>';
+  const srcExtrap   = '<span style="color:var(--purple);font-size:10px">EXTRAPOLATED ⟿</span>';
 
   let closestIdx=0, closestDist=Infinity;
   zeros.forEach((z,i)=>{const d=Math.abs(z.t-dealTenor);if(d<closestDist){closestDist=d;closestIdx=i;}});
@@ -1751,15 +1885,30 @@ function renderCurveTable(zeros, ct, dealTenor) {
     const t0  = i>0 ? zeros[i-1].t : 0;
     const fwd = ct.fwdSimple(t0, z.t)*100;
     const isClosest=(i===closestIdx);
+
+    // Determine source badge
+    let srcBadge;
+    if (z.interp === 'interpolated') {
+      srcBadge = srcInterp;
+    } else if (z.interp === 'extrapolated') {
+      srcBadge = srcExtrap;
+    } else {
+      srcBadge = isLive ? srcLive : srcFallback;
+    }
+
+    // Dim interpolated/extrapolated rows slightly
+    const rowStyle = z.interp ? 'opacity:0.82;' : '';
+
     const tr=document.createElement('tr');
+    tr.setAttribute('style', rowStyle);
     tr.innerHTML=`
-      <td class="td-accent">${z.tenor}</td>
+      <td class="td-accent" style="${z.interp?'color:var(--text2)':''}">${z.tenor}</td>
       <td class="td-num">${z.t.toFixed(5)}</td>
-      <td class="td-num td-accent">${(z.quotedRate*100).toFixed(5)}</td>
+      <td class="td-num ${z.interp?'':'td-accent'}" style="${z.interp?'color:var(--purple)':''}">${(z.quotedRate*100).toFixed(5)}</td>
       <td class="td-num">${(z.z*100).toFixed(5)}</td>
       <td class="td-num" style="color:var(--purple)">${z.dfVal.toFixed(6)}</td>
       <td class="td-num" style="color:var(--blue2)">${fwd.toFixed(5)}</td>
-      <td>${z.type==='simple'?'<span style="color:var(--green);font-size:10px">Simple</span>':'<span style="color:var(--amber2);font-size:10px">Semi-ann.</span>'} ${src}${isClosest?' <span class="tag-interp">◆</span>':''}</td>
+      <td>${z.type==='simple'?'<span style="color:var(--green);font-size:10px">Simple</span>':'<span style="color:var(--amber2);font-size:10px">Semi-ann.</span>'} ${srcBadge}${isClosest?' <span class="tag-interp">◆</span>':''}</td>
     `;
     tbody.appendChild(tr);
   });
@@ -1877,7 +2026,8 @@ async function runPricer() {
     if(!oisQuotes) { oisQuotes=FALLBACK_QUOTES; setStatus(false); }
 
     btnText.textContent='BOOTSTRAPPING CURVE...';
-    const zeros = bootstrapZeroCurve(oisQuotes);
+    const bootstrapped = bootstrapZeroCurve(oisQuotes);
+    const zeros = fillMissingTenors(bootstrapped);
     const ct    = buildCurveTools(zeros);
     const tenor = daysBetween(sd,md)/365;
 
