@@ -367,9 +367,7 @@ canvas{width:100%!important;}
         </div>
       </div>
 
-      <div class="conv-note" style="margin-top:10px;">
-        Market convention: MIBOR OIS &gt;1Y = semi-annual · ≤1Y = at maturity · Day count: Actual/365
-      </div>
+
     </div>
 
     <!-- OIS CURVE PANEL -->
@@ -482,6 +480,7 @@ canvas{width:100%!important;}
             <thead><tr>
               <th style="text-align:left;color:var(--text3);font-size:10px;padding:4px 8px;border-bottom:1px solid var(--border);">Tenor</th>
               <th style="color:var(--amber2);font-size:10px;padding:4px 8px;border-bottom:1px solid var(--border);text-align:right;">Wt.Avg.Rate (%)</th>
+              <th style="color:var(--text3);font-size:10px;padding:4px 8px;border-bottom:1px solid var(--border);text-align:left;">Source</th>
             </tr></thead>
             <tbody id="manualCurveBody"></tbody>
           </table>
@@ -763,7 +762,7 @@ function bootstrapZeroCurve(quotes) {
       // DF = 1/(1+r*t)
       const dfVal = 1 / (1 + q.r * q.t);
       const z     = -Math.log(dfVal) / q.t;
-      zeros.push({tenor:q.tenor, t:q.t, z, dfVal, quotedRate:q.r, type:'simple'});
+      zeros.push({tenor:q.tenor, t:q.t, z, dfVal, quotedRate:q.r, type:'simple', interp: q.interp || null});
     } else {
       // Semi-annual bootstrap
       const T = q.t, S = q.r;
@@ -775,7 +774,7 @@ function bootstrapZeroCurve(quotes) {
       // Solve: (S/2)*knownAnnuity + (S/2 + 1)*DF(T) = 1
       const dfVal = (1 - (S/2) * knownAnnuity) / (1 + S/2);
       const z     = dfVal > 0 ? -Math.log(dfVal) / T : zeros[zeros.length-1].z;
-      zeros.push({tenor:q.tenor, t:T, z, dfVal, quotedRate:q.r, type:'semiannual'});
+      zeros.push({tenor:q.tenor, t:T, z, dfVal, quotedRate:q.r, type:'semiannual', interp: q.interp || null});
     }
     // Keep sorted
     zeros.sort((a,b) => a.t - b.t);
@@ -1261,6 +1260,61 @@ async function fetchViaAnthropicAPI() {
   return arr.filter(r => TENORS_ORDER.includes(r.tenor));
 }
 
+// ================================================================
+// INTERPOLATE / EXTRAPOLATE MISSING QUOTED SWAP RATES
+// Operates at the raw quoted-rate level (before bootstrapping).
+// Input:  array of {tenor, t, r, type}  — only the tenors that have real data
+// Output: full 12-tenor array with .interp flag on filled ones
+//
+// Method: natural cubic spline on (t → quoted swap rate).
+//   • Points between known tenors  → 'interpolated'
+//   • Points outside known range   → 'extrapolated' (linear extension)
+// ================================================================
+const CCIL_TENOR_META = [
+  {tenor:'1M',  t:1/12,  type:'simple'},
+  {tenor:'2M',  t:2/12,  type:'simple'},
+  {tenor:'3M',  t:3/12,  type:'simple'},
+  {tenor:'6M',  t:0.5,   type:'simple'},
+  {tenor:'9M',  t:0.75,  type:'simple'},
+  {tenor:'1Y',  t:1.0,   type:'simple'},
+  {tenor:'2Y',  t:2.0,   type:'semiannual'},
+  {tenor:'3Y',  t:3.0,   type:'semiannual'},
+  {tenor:'4Y',  t:4.0,   type:'semiannual'},
+  {tenor:'5Y',  t:5.0,   type:'semiannual'},
+  {tenor:'7Y',  t:7.0,   type:'semiannual'},
+  {tenor:'10Y', t:10.0,  type:'semiannual'},
+];
+
+function interpolateQuotedRates(knownQuotes) {
+  const known = [...knownQuotes].sort((a, b) => a.t - b.t);
+  if (known.length === 0) return [];
+
+  const xs = known.map(q => q.t);
+  const ys = known.map(q => q.r);
+
+  const spline = buildCubicSpline(xs, ys);
+  const tMin = xs[0], tMax = xs[xs.length - 1];
+  const knownTenorSet = new Set(known.map(q => q.tenor));
+
+  return CCIL_TENOR_META.map(meta => {
+    if (knownTenorSet.has(meta.tenor)) {
+      return { ...known.find(q => q.tenor === meta.tenor) };
+    }
+    let rate = spline
+      ? evalCubicSpline(spline, meta.t)
+      : (() => {
+          const lo = known.filter(q => q.t <= meta.t).pop();
+          const hi = known.find(q => q.t >= meta.t);
+          if (lo && hi && lo !== hi)
+            return lo.r + (hi.r - lo.r) * (meta.t - lo.t) / (hi.t - lo.t);
+          return (lo || hi).r;
+        })();
+    rate = Math.max(0.001, Math.min(0.30, rate));
+    const kind = (meta.t < tMin || meta.t > tMax) ? 'extrapolated' : 'interpolated';
+    return { tenor: meta.tenor, t: meta.t, r: rate, type: meta.type, interp: kind };
+  });
+}
+
 // ── Main fetch orchestrator ───────────────────────────────────────────────────
 async function fetchLiveCurve() {
   const btn     = document.getElementById('liveFetchBtn');
@@ -1313,23 +1367,47 @@ async function fetchLiveCurve() {
 
   _liveFetchedRates = ratesArray;
 
+  // ── Build interpolated full set for preview ───────────────────────────────
+  const T_MAP_P = {'1M':1/12,'2M':2/12,'3M':3/12,'6M':0.5,'9M':0.75,'1Y':1,
+                   '2Y':2,'3Y':3,'4Y':4,'5Y':5,'7Y':7,'10Y':10};
+  const TYPE_MAP_P = {'1M':'simple','2M':'simple','3M':'simple','6M':'simple','9M':'simple','1Y':'simple',
+                      '2Y':'semiannual','3Y':'semiannual','4Y':'semiannual','5Y':'semiannual','7Y':'semiannual','10Y':'semiannual'};
+  const knownForPreview = ratesArray
+    .filter(r => r.warr && r.warr > 0 && T_MAP_P[r.tenor])
+    .map(r => ({ tenor: r.tenor, t: T_MAP_P[r.tenor], r: r.warr / 100, type: TYPE_MAP_P[r.tenor] }));
+  const previewFull = interpolateQuotedRates(knownForPreview);
+
   // ── Render preview table ──────────────────────────────────────────────────
   const tbody = document.getElementById('liveFetchTbody');
   tbody.innerHTML = '';
   TENORS_ORDER.forEach(tenor => {
-    const r = ratesArray.find(x => x.tenor === tenor);
-    if (!r) {
-      const fb = FALLBACK_QUOTES.find(q => q.tenor === tenor);
+    const live = ratesArray.find(x => x.tenor === tenor);
+    const filled = previewFull.find(x => x.tenor === tenor);
+    const warr = live && live.warr > 0 ? live.warr : null;
+
+    if (!warr) {
+      // Missing from CCIL today — show interpolated/extrapolated value
+      const interpRate = filled ? filled.r : null;
+      const kind = filled && filled.interp === 'extrapolated' ? 'EXTRAPOLATED ⟿' : 'INTERPOLATED ◈';
       const tr = document.createElement('tr');
       tr.innerHTML =
         '<td style="padding:5px 8px;color:var(--text);font-size:12px;">' + tenor + '</td>' +
-        '<td style="padding:5px 8px;text-align:right;color:var(--text3);font-size:12px;">' +
-          (fb ? (fb.r*100).toFixed(5) : '—') + ' <span style="font-size:9px">(fallback)</span></td>' +
-        '<td colspan="4" style="padding:5px 8px;color:var(--text3);font-size:11px;">no data today</td>';
+        '<td style="padding:5px 8px;text-align:right;color:var(--purple);font-size:12px;">' +
+          (interpRate ? (interpRate*100).toFixed(5) : '—') + '</td>' +
+        '<td colspan="4" style="padding:5px 8px;color:var(--purple);font-size:11px;">' + kind + '</td>';
       tbody.appendChild(tr);
+
+      // Mirror interpolated value into manual inputs too
+      document.querySelectorAll('#manualCurveBody tr').forEach(mtr => {
+        if (mtr.dataset.tenor === tenor && interpRate) {
+          const inp = mtr.querySelector('input[type="number"]');
+          if (inp) inp.value = (interpRate*100).toFixed(5);
+          setManualRowBadge(tenor, filled.interp); // 'interpolated' or 'extrapolated'
+        }
+      });
       return;
     }
-    const warr = r.warr, prev = r.prev;
+    const prev = live.prev;
     const chgBps = (warr && prev) ? ((warr - prev) * 100).toFixed(1) : null;
     const chgCol = !chgBps ? 'var(--text3)' : parseFloat(chgBps) > 0 ? 'var(--red)' : parseFloat(chgBps) < 0 ? 'var(--green)' : 'var(--text3)';
     const chgStr = !chgBps ? '—' : (parseFloat(chgBps) >= 0 ? '+' : '') + chgBps;
@@ -1339,8 +1417,8 @@ async function fetchLiveCurve() {
       '<td style="padding:5px 8px;text-align:right;color:var(--amber2);font-size:12px;font-weight:500;">' + (warr ? warr.toFixed(5) : '—') + '</td>' +
       '<td style="padding:5px 8px;text-align:right;color:var(--blue2);font-size:12px;">' + (prev ? prev.toFixed(5) : '—') + '</td>' +
       '<td style="padding:5px 8px;text-align:right;color:' + chgCol + ';font-size:12px;">' + chgStr + '</td>' +
-      '<td style="padding:5px 8px;text-align:right;color:var(--text2);font-size:12px;">' + (r.vol ? Number(r.vol).toLocaleString('en-IN') : '—') + '</td>' +
-      '<td style="padding:5px 8px;text-align:right;color:var(--text2);font-size:12px;">' + (r.trades || '—') + '</td>';
+      '<td style="padding:5px 8px;text-align:right;color:var(--text2);font-size:12px;">' + (live.vol ? Number(live.vol).toLocaleString('en-IN') : '—') + '</td>' +
+      '<td style="padding:5px 8px;text-align:right;color:var(--text2);font-size:12px;">' + (live.trades || '—') + '</td>';
     tbody.appendChild(tr);
 
     // Mirror into manual entry inputs
@@ -1348,6 +1426,7 @@ async function fetchLiveCurve() {
       if (mtr.dataset.tenor === tenor && warr) {
         const inp = mtr.querySelector('input[type="number"]');
         if (inp) inp.value = warr.toFixed(5);
+        setManualRowBadge(tenor, 'live');
       }
     });
   });
@@ -1362,32 +1441,54 @@ async function fetchLiveCurve() {
 }
 function applyLiveFetchedRates() {
   if (!_liveFetchedRates) return;
-  const TENORS_ORDER = ['1M','2M','3M','6M','9M','1Y','2Y','3Y','4Y','5Y','7Y','10Y'];
-  const TYPE_MAP = {'1M':'simple','2M':'simple','3M':'simple','6M':'simple','9M':'simple','1Y':'simple',
-                    '2Y':'semiannual','3Y':'semiannual','4Y':'semiannual','5Y':'semiannual','7Y':'semiannual','10Y':'semiannual'};
   const T_MAP = {'1M':1/12,'2M':2/12,'3M':3/12,'6M':0.5,'9M':0.75,'1Y':1,
                  '2Y':2,'3Y':3,'4Y':4,'5Y':5,'7Y':7,'10Y':10};
+  const TYPE_MAP = {'1M':'simple','2M':'simple','3M':'simple','6M':'simple','9M':'simple','1Y':'simple',
+                    '2Y':'semiannual','3Y':'semiannual','4Y':'semiannual','5Y':'semiannual','7Y':'semiannual','10Y':'semiannual'};
 
-  // Build the quotes array — for any missing tenor fall back to FALLBACK_QUOTES
-  const curve = TENORS_ORDER.map(tenor => {
-    const r = _liveFetchedRates.find(x => x.tenor === tenor);
-    const warr = r && typeof r.warr === 'number' && r.warr > 0 ? r.warr : null;
-    if (warr !== null) {
-      return { tenor, t: T_MAP[tenor], r: warr / 100, type: TYPE_MAP[tenor] };
-    } else {
-      const fb = FALLBACK_QUOTES.find(q => q.tenor === tenor);
-      return fb ? { ...fb } : null;
-    }
-  }).filter(Boolean);
+  // Step 1 — collect only the tenors that actually have live data today
+  const knownQuotes = _liveFetchedRates
+    .filter(r => r.warr && r.warr > 0 && T_MAP[r.tenor])
+    .map(r => ({ tenor: r.tenor, t: T_MAP[r.tenor], r: r.warr / 100, type: TYPE_MAP[r.tenor] }));
 
-  // Also include O/N from fallback
-  const fullCurve = [FALLBACK_QUOTES.find(q => q.tenor === 'O/N'), ...curve].filter(Boolean);
+  // Step 2 — fill any missing standard tenors via cubic spline interp/extrap
+  const fullTwelve = interpolateQuotedRates(knownQuotes);
+
+  // Step 3 — prepend O/N from fallback (never traded on CCIL OIS screen)
+  const onFallback = FALLBACK_QUOTES.find(q => q.tenor === 'O/N');
+  const fullCurve = [onFallback, ...fullTwelve].filter(Boolean);
+
+  // Step 4 — update preview table to show interpolated/extrapolated rows clearly
+  const tbody = document.getElementById('liveFetchTbody');
+  if (tbody) {
+    const rows = tbody.querySelectorAll('tr');
+    fullTwelve.forEach(q => {
+      if (!q.interp) return;
+      rows.forEach(tr => {
+        const firstCell = tr.querySelector('td');
+        if (firstCell && firstCell.textContent.trim() === q.tenor) {
+          // Replace the "no data today" row with interpolated value
+          const kind = q.interp === 'extrapolated' ? 'EXTRAPOLATED ⟿' : 'INTERPOLATED ◈';
+          const col  = 'var(--purple)';
+          tr.innerHTML =
+            `<td style="padding:5px 8px;color:var(--text);font-size:12px;">${q.tenor}</td>` +
+            `<td style="padding:5px 8px;text-align:right;color:${col};font-size:12px;">${(q.r*100).toFixed(5)}</td>` +
+            `<td colspan="4" style="padding:5px 8px;color:${col};font-size:11px;">${kind}</td>`;
+        }
+      });
+    });
+  }
 
   oisQuotes = fullCurve;
   setStatus(true);
   document.getElementById('manualPanel').style.display   = 'none';
   document.getElementById('manualApplied').style.display = 'block';
-  document.getElementById('manualAppliedDate').textContent = 'Live rates applied ' + new Date().toLocaleString('en-IN');
+
+  // Show how many tenors were interpolated/extrapolated
+  const nInterp = fullTwelve.filter(q => q.interp).length;
+  const interpNote = nInterp > 0 ? ` (${nInterp} tenor${nInterp>1?'s':''} interpolated/extrapolated)` : '';
+  document.getElementById('manualAppliedDate').textContent =
+    'Live rates applied ' + new Date().toLocaleString('en-IN') + interpNote;
   document.querySelector('.btn-toggle').textContent = 'UPDATE RATES ▾';
 }
 
@@ -1435,62 +1536,142 @@ function processExcelFile(file) {
       const data = new Uint8Array(e.target.result);
       const wb   = XLSX.read(data, { type: 'array' });
 
-      // Find the Summary sheet (or first sheet)
-      const sheetName = wb.SheetNames.find(n => n.toLowerCase().includes('summary')) || wb.SheetNames[0];
-      const ws = wb.Sheets[sheetName];
-      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
-
-      // Find the MIBOR OIS header row — look for "Wt. Avg Rate" in a row
-      // Then collect tenor rows immediately after until we hit "Total"
       const TENORS = new Set(['1M','2M','3M','6M','9M','1Y','2Y','3Y','4Y','5Y','7Y','10Y']);
-      let wtAvgCol = -1;
-      let tenorCol = -1;
-      let inMibor  = false;
       const extracted = [];
 
-      for (let i = 0; i < rows.length; i++) {
-        const row = rows[i];
-        if (!row) continue;
+      // ── Try every sheet until we find rates ──────────────────────────────
+      for (const sheetName of wb.SheetNames) {
+        if (extracted.length >= 2) break;
+        const ws   = wb.Sheets[sheetName];
+        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
 
-        // Detect MIBOR OIS section start
-        const rowStr = row.join('|').toUpperCase();
-        if (rowStr.includes('MIBOR OIS') && !rowStr.includes('MMFOR')) inMibor = true;
-        if (inMibor && rowStr.includes('MMFOR')) break; // stop at MMFOR section
+        // ── Strategy 1: Full CCIL file — look for MIBOR OIS section ─────
+        let wtAvgCol = -1, tenorCol = -1, inMibor = false;
+        const ccilExtracted = [];
 
-        // Detect header row with "Wt. Avg Rate"
-        if (inMibor && wtAvgCol === -1) {
-          for (let c = 0; c < row.length; c++) {
-            const cell = String(row[c] || '').toLowerCase();
-            if (cell.includes('wt') && cell.includes('avg')) wtAvgCol = c;
-            if (cell === 'maturity' || cell.includes('tenor')) tenorCol = c;
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i];
+          if (!row) continue;
+          const rowStr = row.join('|').toUpperCase();
+
+          if (rowStr.includes('MIBOR OIS') && !rowStr.includes('MMFOR')) inMibor = true;
+          if (inMibor && rowStr.includes('MMFOR')) break;
+
+          if (inMibor && wtAvgCol === -1) {
+            for (let c = 0; c < row.length; c++) {
+              const cell = String(row[c] || '').toLowerCase();
+              if (cell.includes('wt') && cell.includes('avg')) wtAvgCol = c;
+              if (cell === 'maturity' || cell.includes('tenor')) tenorCol = c;
+            }
+            if (wtAvgCol === -1) continue;
+            if (tenorCol === -1) tenorCol = 0;
+            continue;
           }
-          if (wtAvgCol === -1) continue;
-          // Default to col 0 for tenor if not found
-          if (tenorCol === -1) tenorCol = 0;
-          continue;
+
+          if (inMibor && wtAvgCol !== -1) {
+            const tenor = String(row[tenorCol] || '').trim().toUpperCase();
+            const rate  = parseFloat(row[wtAvgCol]);
+            if (tenor === 'TOTAL' || tenor === '' || !TENORS.has(tenor)) continue;
+            if (!isNaN(rate) && rate > 0) ccilExtracted.push({ tenor, rate });
+          }
         }
 
-        // Collect data rows
-        if (inMibor && wtAvgCol !== -1) {
-          const tenor = String(row[tenorCol] || '').trim().toUpperCase();
-          const rate  = parseFloat(row[wtAvgCol]);
-          if (tenor === 'TOTAL' || tenor === '' || !TENORS.has(tenor)) continue;
-          if (!isNaN(rate) && rate > 0) extracted.push({ tenor, rate });
+        if (ccilExtracted.length >= 2) {
+          extracted.push(...ccilExtracted);
+          break;
+        }
+
+        // ── Strategy 2: Simple 2-column format (Maturity | Wt.Avg.Rate) ──
+        let simpleMatCol = -1, simpleRateCol = -1;
+        const simpleExtracted = [];
+        let headerFound = false;
+
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i];
+          if (!row) continue;
+
+          // Step 1 — find columns from header row
+          if (!headerFound) {
+            let matC = -1, rateC = -1;
+            for (let c = 0; c < row.length; c++) {
+              const cell = String(row[c] || '').toLowerCase().trim();
+              if (cell === 'maturity' || cell === 'tenor' || cell === 'term') matC = c;
+              if (cell.includes('wt') || cell.includes('avg') || cell.includes('rate')) rateC = c;
+            }
+            if (matC !== -1 && rateC !== -1) {
+              simpleMatCol = matC;
+              simpleRateCol = rateC;
+              headerFound = true;
+              continue; // header row done, next rows are data
+            }
+
+            // No explicit header — check if this row itself has a valid tenor
+            for (let c = 0; c < row.length; c++) {
+              const cell = String(row[c] || '').trim().toUpperCase();
+              if (TENORS.has(cell)) {
+                simpleMatCol = c;
+                // Rate col = first other col with a positive number
+                for (let c2 = 0; c2 < row.length; c2++) {
+                  if (c2 === c) continue;
+                  const v = parseFloat(row[c2]);
+                  if (!isNaN(v) && v > 0) { simpleRateCol = c2; break; }
+                }
+                headerFound = true;
+                break;
+              }
+            }
+            // If this row itself is a data row (no header), process it now
+            if (headerFound && simpleMatCol !== -1 && simpleRateCol !== -1) {
+              const tenor = String(row[simpleMatCol] || '').trim().toUpperCase();
+              const rate  = parseFloat(row[simpleRateCol]);
+              if (TENORS.has(tenor) && !isNaN(rate) && rate > 0) simpleExtracted.push({ tenor, rate });
+            }
+            continue;
+          }
+
+          // Step 2 — collect data rows
+          const tenor = String(row[simpleMatCol] || '').trim().toUpperCase();
+          const rate  = parseFloat(row[simpleRateCol]);
+          if (!TENORS.has(tenor)) continue;
+          if (!isNaN(rate) && rate > 0) simpleExtracted.push({ tenor, rate });
+        }
+
+        if (simpleExtracted.length >= 2) {
+          extracted.push(...simpleExtracted);
         }
       }
 
-      if (extracted.length < 6) {
-        throw new Error(`Only found ${extracted.length} MIBOR OIS rates. Is this the correct CCIL Excel file?`);
+      if (extracted.length < 2) {
+        throw new Error(`Could not find valid tenor/rate data. Need at least 2 rows with tenors like 1M, 6M, 1Y, 5Y etc. and their rates.`);
       }
 
-      // Fill the manual input table
+      // ── Build known quotes and interpolate missing tenors ─────────────────
+      const T_MAP_E = {'1M':1/12,'2M':2/12,'3M':3/12,'6M':0.5,'9M':0.75,'1Y':1,
+                       '2Y':2,'3Y':3,'4Y':4,'5Y':5,'7Y':7,'10Y':10};
+      const TYPE_MAP_E = {'1M':'simple','2M':'simple','3M':'simple','6M':'simple','9M':'simple','1Y':'simple',
+                          '2Y':'semiannual','3Y':'semiannual','4Y':'semiannual','5Y':'semiannual','7Y':'semiannual','10Y':'semiannual'};
+      const knownExcel = extracted
+        .filter(({ tenor }) => T_MAP_E[tenor])
+        .map(({ tenor, rate }) => ({ tenor, t: T_MAP_E[tenor], r: rate / 100, type: TYPE_MAP_E[tenor] }));
+
+      // Interpolate / extrapolate any missing standard tenors
+      const fullTwelveExcel = interpolateQuotedRates(knownExcel);
+      const nInterp = fullTwelveExcel.filter(q => q.interp).length;
+
+      // Fill the manual input table — real values in amber, interp/extrap in purple
       let filled = 0;
-      extracted.forEach(({ tenor, rate }) => {
-        const rows = document.querySelectorAll('#manualCurveBody tr');
-        rows.forEach(tr => {
-          if (tr.dataset.tenor === tenor) {
+      fullTwelveExcel.forEach(q => {
+        document.querySelectorAll('#manualCurveBody tr').forEach(tr => {
+          if (tr.dataset.tenor === q.tenor) {
             const inp = tr.querySelector('input[type="number"]');
-            if (inp) { inp.value = rate.toFixed(5); filled++; }
+            if (inp) {
+              inp.value = (q.r * 100).toFixed(5);
+              inp.title = q.interp
+                ? (q.interp === 'extrapolated' ? 'Extrapolated (no market data)' : 'Interpolated (no market data)')
+                : 'From Excel';
+              filled++;
+            }
+            setManualRowBadge(q.tenor, q.interp || 'live');
           }
         });
       });
@@ -1498,7 +1679,8 @@ function processExcelFile(file) {
       // Switch to manual tab so user can review
       switchCurveTab('manual');
       statusEl.style.color = 'var(--green)';
-      statusEl.textContent = `✓ Extracted ${filled} rates from "${file.name}" — review above and click Apply`;
+      const interpMsg = nInterp > 0 ? ` · ${nInterp} missing tenor${nInterp>1?'s':''} interpolated (shown in purple)` : '';
+      statusEl.textContent = `✓ Extracted ${extracted.length} rates from "${file.name}"${interpMsg} — review and click Apply`;
 
     } catch(err) {
       statusEl.style.color = 'var(--red)';
@@ -1514,34 +1696,57 @@ function processExcelFile(file) {
 
 function buildManualCurveFromUI() {
   const rows = document.querySelectorAll('#manualCurveBody tr');
-  const result = [];
-  let valid = true;
+  const known = [];
   rows.forEach(tr => {
     const tenor = tr.dataset.tenor;
     const t     = parseFloat(tr.dataset.t);
     const type  = tr.dataset.type;
+    if (tenor === 'O/N') return; // O/N handled separately
     const input = tr.querySelector('input[type="number"]');
-    if (!input) { valid = false; return; }
+    if (!input) return;
     const val = parseFloat(input.value);
-    if (isNaN(val) || val <= 0 || val > 30) { valid = false; return; }
-    result.push({tenor, t, r: val/100, type});
+    if (!isNaN(val) && val > 0 && val <= 30) {
+      known.push({ tenor, t, r: val / 100, type });
+    }
   });
-  if (!valid || result.length < 12) return null;
-  return result;
+  if (known.length < 2) return null; // need at least 2 points to interpolate
+  return known;
 }
 
 function applyManualCurve() {
-  const curve = buildManualCurveFromUI();
-  if (!curve) {
-    alert('Please fill in all rate fields with valid values (0–30%).');
+  const known = buildManualCurveFromUI();
+  if (!known) {
+    alert('Please fill in at least 2 rate fields with valid values (0–30%).');
     return;
   }
-  oisQuotes = curve;
+
+  // Fill any missing standard tenors via cubic spline
+  const fullTwelve = interpolateQuotedRates(known);
+  const onFallback = FALLBACK_QUOTES.find(q => q.tenor === 'O/N');
+  oisQuotes = [onFallback, ...fullTwelve].filter(Boolean);
+
+  // Reflect interpolated values back into the input cells (visual feedback)
+  fullTwelve.forEach(q => {
+    if (!q.interp) return;
+    document.querySelectorAll('#manualCurveBody tr').forEach(tr => {
+      if (tr.dataset.tenor === q.tenor && tr.dataset.source !== 'manual') {
+        const inp = tr.querySelector('input[type="number"]');
+        if (inp) {
+          inp.value = (q.r * 100).toFixed(5);
+          inp.title = q.interp === 'extrapolated' ? 'Extrapolated' : 'Interpolated';
+        }
+        setManualRowBadge(q.tenor, q.interp);
+      }
+    });
+  });
+
   setStatus(true);
   document.getElementById('manualPanel').style.display = 'none';
   document.getElementById('manualApplied').style.display = 'block';
-  // Show applied date
-  document.getElementById('manualAppliedDate').textContent = 'Rates applied ' + new Date().toLocaleString('en-IN');
+  const nInterp = fullTwelve.filter(q => q.interp).length;
+  const interpNote = nInterp > 0 ? ` (${nInterp} tenor${nInterp>1?'s':''} interpolated/extrapolated)` : '';
+  document.getElementById('manualAppliedDate').textContent =
+    'Rates applied ' + new Date().toLocaleString('en-IN') + interpNote;
 }
 
 function toggleManualPanel() {
@@ -1558,9 +1763,10 @@ function toggleManualPanel() {
   const tbody = document.getElementById('manualCurveBody');
   FALLBACK_QUOTES.forEach(q => {
     const tr = document.createElement('tr');
-    tr.dataset.tenor = q.tenor;
-    tr.dataset.t     = q.t;
-    tr.dataset.type  = q.type;
+    tr.dataset.tenor  = q.tenor;
+    tr.dataset.t      = q.t;
+    tr.dataset.type   = q.type;
+    tr.dataset.source = 'fallback'; // fallback | live | interpolated | extrapolated | manual
     tr.innerHTML = `
       <td style="padding:5px 8px;color:var(--text);font-size:12px;font-family:var(--mono)">${q.tenor}</td>
       <td style="padding:5px 8px;text-align:right;">
@@ -1569,13 +1775,53 @@ function toggleManualPanel() {
                  font-family:var(--mono);font-size:12px;padding:3px 6px;border-radius:3px;
                  width:90px;text-align:right;outline:none;"
           onfocus="this.style.borderColor='var(--amber)'"
-          onblur="this.style.borderColor='var(--border)'">
+          onblur="this.style.borderColor='var(--border)'"
+          oninput="markManualEdit(this)">
         <span style="color:var(--text3);font-size:10px;margin-left:2px">%</span>
+      </td>
+      <td style="padding:5px 8px;" class="manual-source-badge">
+        <span style="font-size:9px;font-family:var(--mono);color:var(--text3);">FALLBACK</span>
       </td>
     `;
     tbody.appendChild(tr);
   });
 })();
+
+// Called whenever user types into a manual rate input
+function markManualEdit(inp) {
+  const tr = inp.closest('tr');
+  if (!tr) return;
+  tr.dataset.source = 'manual';
+  inp.style.color = 'var(--amber2)';
+  inp.title = 'Manually entered';
+  const badge = tr.querySelector('.manual-source-badge');
+  if (badge) badge.innerHTML = '<span style="font-size:9px;font-family:var(--mono);color:var(--amber);background:rgba(245,166,35,.12);padding:1px 5px;border-radius:3px;border:1px solid rgba(245,166,35,.3);">MANUAL</span>';
+}
+
+// Set the source badge on a manual-table row
+function setManualRowBadge(tenor, source) {
+  document.querySelectorAll('#manualCurveBody tr').forEach(tr => {
+    if (tr.dataset.tenor !== tenor) return;
+    tr.dataset.source = source;
+    const badge = tr.querySelector('.manual-source-badge');
+    if (!badge) return;
+    const cfg = {
+      live:          { label: 'LIVE ✓',        color: 'var(--green)',  bg: 'rgba(61,214,140,.1)',  border: 'rgba(61,214,140,.3)' },
+      interpolated:  { label: 'INTERPOLATED ◈', color: 'var(--purple)', bg: 'rgba(167,139,250,.1)', border: 'rgba(167,139,250,.3)' },
+      extrapolated:  { label: 'EXTRAPOLATED ⟿', color: 'var(--purple)', bg: 'rgba(167,139,250,.1)', border: 'rgba(167,139,250,.3)' },
+      manual:        { label: 'MANUAL',          color: 'var(--amber)',  bg: 'rgba(245,166,35,.12)', border: 'rgba(245,166,35,.3)' },
+      fallback:      { label: 'FALLBACK',        color: 'var(--text3)', bg: 'transparent',           border: 'transparent' },
+    };
+    const c = cfg[source] || cfg.fallback;
+    badge.innerHTML = `<span style="font-size:9px;font-family:var(--mono);color:${c.color};background:${c.bg};padding:1px 5px;border-radius:3px;border:1px solid ${c.border};">${c.label}</span>`;
+
+    // Also update input colour to match
+    const inp = tr.querySelector('input[type="number"]');
+    if (inp) {
+      inp.style.color = source === 'interpolated' || source === 'extrapolated' ? 'var(--purple)' : 'var(--amber2)';
+    }
+  });
+}
 function addMonths(date, months) {
   const d = new Date(date);
   const day = d.getDate();
@@ -2006,7 +2252,20 @@ async function runPricer() {
   if(!notional||notional<=0) return showError('Enter a valid notional amount.');
 
   if (partialIrs) {
-    if (!loanMaturityDate) return showError('Enter the full Loan Maturity Date.');
+    if (!loanMaturityDate) {
+      // Highlight the field and scroll it into view
+      const lmdField = document.getElementById('loanMaturityDate');
+      lmdField.className = 'date-text err';
+      lmdField.placeholder = 'Required — enter loan maturity date';
+      lmdField.focus();
+      lmdField.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      // Clear the error styling once user starts typing
+      lmdField.addEventListener('input', function clearErr() {
+        lmdField.className = 'date-text';
+        lmdField.removeEventListener('input', clearErr);
+      });
+      return showError('Partial IRS is enabled — please enter the full Loan Maturity Date.');
+    }
     const lmd = new Date(loanMaturityDate);
     if (lmd <= md) return showError('Loan Maturity Date must be after IRS end (Maturity Date).');
   }
