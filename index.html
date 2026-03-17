@@ -280,8 +280,17 @@ canvas{width:100%!important;}
         </div>
         <div class="field">
           <label>NOTIONAL AMOUNT</label>
-          <input type="number" id="notional" value="10000000" min="1">
-          <span class="unit">INR</span>
+          <input type="text" id="notionalDisplay" value="1,00,00,000"
+            autocomplete="off" spellcheck="false"
+            placeholder="e.g. 10Cr, 50L, 1,00,00,000"
+            style="background:var(--bg2);border:1px solid var(--border);color:var(--text);
+                   padding:8px 10px;border-radius:5px;font-family:var(--mono);font-size:13px;
+                   outline:none;transition:border-color .2s;width:100%;"
+            oninput="parseNotionalInput(this)"
+            onfocus="this.style.borderColor='var(--amber)'"
+            onblur="formatNotionalDisplay(this);this.style.borderColor='var(--border)'">
+          <input type="hidden" id="notional" value="10000000">
+          <span class="unit" id="notionalUnit">= ₹ 1.00 Cr</span>
         </div>
         <div class="field">
           <label>PRINCIPAL FREQUENCY</label>
@@ -518,11 +527,7 @@ canvas{width:100%!important;}
         <div class="metric-val" id="mPvFloat">—</div>
         <div class="metric-sub">₹ Cr</div>
       </div>
-      <div class="metric-card">
-        <div class="metric-name">Swap MTM</div>
-        <div class="metric-val" id="mMtm">—</div>
-        <div class="metric-sub">₹ Cr</div>
-      </div>
+
       <div class="metric-card">
         <div class="metric-name">Tenor</div>
         <div class="metric-val" id="mTenor">—</div>
@@ -542,6 +547,11 @@ canvas{width:100%!important;}
         <div class="metric-name">PV01</div>
         <div class="metric-val" id="mPv01">—</div>
         <div class="metric-sub">₹ per 1 bps shift</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-name">Avg Maturity</div>
+        <div class="metric-val" id="mAvgMat">—</div>
+        <div class="metric-sub">years (principal-wtd)</div>
       </div>
     </div>
 
@@ -573,13 +583,19 @@ canvas{width:100%!important;}
       </div>
     </div>
 
-    <div class="card" id="chartCard">
-      <div class="card-title">Interest Cash Flows — Fixed (amber) vs Float Fwd+Spread (blue)</div>
-      <div class="chart-wrap"><canvas id="cfChart"></canvas></div>
-    </div>
-
     <div class="card" id="cfCard">
-      <div class="card-title">Cash Flow Schedule</div>
+      <div class="card-title">
+        <span>Cash Flow Schedule</span>
+        <button onclick="exportCFtoExcel()" id="exportCFBtn"
+          style="padding:5px 12px;background:rgba(61,214,140,.12);border:1px solid rgba(61,214,140,.3);
+                 color:var(--green);border-radius:4px;font-family:var(--mono);font-size:10px;
+                 font-weight:600;cursor:pointer;letter-spacing:.5px;transition:all .2s;"
+          onmouseover="this.style.background='rgba(61,214,140,.22)'"
+          onmouseout="this.style.background='rgba(61,214,140,.12)'"
+          title="Download Cash Flow Schedule as Excel">
+          ⬇ EXPORT XLSX
+        </button>
+      </div>
       <div class="table-wrap cf-scroll">
         <table>
           <thead><tr>
@@ -593,6 +609,28 @@ canvas{width:100%!important;}
             <th class="td-num">Net PV P&amp;L</th>
           </tr></thead>
           <tbody id="cfTbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+
+    <div class="card" id="yieldSensCard">
+      <div class="card-title">
+        <span>Swap Value Sensitivity · Parallel Discount Curve Shift</span>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--text3);letter-spacing:.5px;">ΔPVF − ΔPVX = ΔSwap Value</span>
+      </div>
+      <div style="font-size:10px;font-family:var(--mono);color:var(--text3);margin-bottom:10px;line-height:1.7;">
+        Each row re-bootstraps the full OIS curve shifted ±N bps, then reprices both legs from the <strong style="color:var(--amber2)">client's perspective</strong>. &nbsp;|&nbsp;
+        <strong style="color:var(--text2)">Receive Fixed:</strong> yields ↑ → <span style="color:var(--red)">negative</span> &nbsp;|&nbsp;
+        <strong style="color:var(--text2)">Pay Fixed:</strong> yields ↑ → <span style="color:var(--green)">positive</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Yield Shift</th>
+            <th class="td-num">Swap Value (₹)</th>
+          </tr></thead>
+          <tbody id="yieldSensTbody"></tbody>
         </table>
       </div>
     </div>
@@ -714,10 +752,60 @@ function setSolveMode(mode) {
 }
 
 // ================================================================
+// RBI REPO RATE — used as the O/N MIBOR anchor at all times
+// Seeded with the current RBI rate (5.25% as of Feb 2026 MPC).
+// fetchRepoRate() attempts to fetch the live rate via Anthropic API
+// on page load and will update this if successful.
+// ================================================================
+let REPO_RATE = 5.25 / 100;   // RBI repo rate (% p.a.) — updated by fetchRepoRate()
+
+async function fetchRepoRate() {
+  try {
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 200,
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        messages: [{ role: 'user', content:
+          'What is the current RBI repo rate right now? Reply with ONLY a JSON object like {"repo_rate": 5.25} — the number in percent, nothing else.' }]
+      })
+    });
+    const d1 = await resp.json();
+    // Second turn: extract just the number
+    const resp2 = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 50,
+        messages: [
+          { role: 'user', content: 'What is the current RBI repo rate right now? Reply with ONLY a JSON object like {"repo_rate": 5.25} — the number in percent, nothing else.' },
+          { role: 'assistant', content: d1.content },
+          { role: 'user', content: 'Output ONLY the JSON object {"repo_rate": X} where X is the number. No extra text.' }
+        ]
+      })
+    });
+    const d2 = await resp2.json();
+    const raw = (d2.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+    const clean = raw.replace(/```json|```/gi, '').trim();
+    const parsed = JSON.parse(clean);
+    if (parsed && typeof parsed.repo_rate === 'number' && parsed.repo_rate > 0 && parsed.repo_rate < 20) {
+      REPO_RATE = parsed.repo_rate / 100;
+      // Update the locked O/N input in the manual table
+        // O/N row removed — repo rate no longer shown in manual table
+      console.log('RBI Repo Rate updated to', parsed.repo_rate + '%');
+    }
+  } catch(e) {
+    console.warn('fetchRepoRate failed, using seed value:', e.message);
+  }
+}
+
+// ================================================================
 // FALLBACK: CCIL OIS QUOTED RATES (Mar 2025, from uploaded image)
 // ================================================================
 const FALLBACK_QUOTES = [
-  {tenor:'O/N', t:0.00274,  r:5.25000/100, type:'simple'},
   {tenor:'1M',  t:0.08333,  r:5.41021/100, type:'simple'},
   {tenor:'2M',  t:0.16667,  r:5.41250/100, type:'simple'},
   {tenor:'3M',  t:0.25000,  r:5.47556/100, type:'simple'},
@@ -734,13 +822,15 @@ const FALLBACK_QUOTES = [
 
 // ================================================================
 // BOOTSTRAP ZERO CURVE FROM CCIL OIS QUOTES
-// Returns array of {tenor, t, quotedRate, zeroCC, dfVal}
+// Uses log-linear interpolation on DFs for coupon date lookups
+// (equivalent to linear interpolation of CC zero rates, kink-free)
 // ================================================================
 function bootstrapZeroCurve(quotes) {
   const sorted = [...quotes].sort((a,b) => a.t - b.t);
-  const zeros  = [];  // {t, z(CC), dfVal, tenor, quotedRate, type}
+  const zeros  = [];
 
-  // Lookup already-bootstrapped DF via linear interp on zero rates
+  // Log-linear DF interpolation: ln(DF) is linear between nodes
+  // => zero rate is constant-forward between pillars (no kinks)
   function dfAtT(t) {
     if (t <= 0) return 1.0;
     if (zeros.length === 0) return 1.0;
@@ -749,9 +839,10 @@ function bootstrapZeroCurve(quotes) {
     if (t >= zeros[n-1].t) return Math.exp(-zeros[n-1].z * t);
     for (let i = 0; i < n-1; i++) {
       if (zeros[i].t <= t && zeros[i+1].t >= t) {
-        const {t:t0,z:z0} = zeros[i], {t:t1,z:z1} = zeros[i+1];
-        const z = z0 + (z1-z0)*(t-t0)/(t1-t0);
-        return Math.exp(-z*t);
+        const {t:t0, dfVal:d0} = zeros[i], {t:t1, dfVal:d1} = zeros[i+1];
+        // log-linear: ln(DF(t)) = ln(d0) + (ln(d1)-ln(d0))*(t-t0)/(t1-t0)
+        const lnDF = Math.log(d0) + (Math.log(d1) - Math.log(d0)) * (t - t0) / (t1 - t0);
+        return Math.exp(lnDF);
       }
     }
     return Math.exp(-zeros[n-1].z * t);
@@ -759,77 +850,119 @@ function bootstrapZeroCurve(quotes) {
 
   for (const q of sorted) {
     if (q.type === 'simple') {
-      // DF = 1/(1+r*t)
+      // INR OIS ≤1Y: simple rate convention  DF = 1/(1 + r·t)
       const dfVal = 1 / (1 + q.r * q.t);
       const z     = -Math.log(dfVal) / q.t;
       zeros.push({tenor:q.tenor, t:q.t, z, dfVal, quotedRate:q.r, type:'simple', interp: q.interp || null});
     } else {
-      // Semi-annual bootstrap
+      // Semi-annual coupon bootstrap
+      // Solve: (S/2)·Σ DF(t_i) + (1 + S/2)·DF(T) = 1
       const T = q.t, S = q.r;
-      // Coupon dates: 0.5, 1.0, ..., T-0.5
       const couponDates = [];
       for (let d = 0.5; d < T - 1e-9; d += 0.5) couponDates.push(d);
-      // Sum of coupon PVs for all dates except T (known DFs)
       const knownAnnuity = couponDates.reduce((s, d) => s + dfAtT(d), 0);
-      // Solve: (S/2)*knownAnnuity + (S/2 + 1)*DF(T) = 1
       const dfVal = (1 - (S/2) * knownAnnuity) / (1 + S/2);
       const z     = dfVal > 0 ? -Math.log(dfVal) / T : zeros[zeros.length-1].z;
       zeros.push({tenor:q.tenor, t:T, z, dfVal, quotedRate:q.r, type:'semiannual', interp: q.interp || null});
     }
-    // Keep sorted
     zeros.sort((a,b) => a.t - b.t);
   }
-
   return zeros;
 }
 
 // ================================================================
-// CUBIC SPLINE INTERPOLATION (natural spline on zero rates vs t)
-// Used to fill missing standard tenors with interpolated/extrapolated quotes
+// HYMAN (1983) MONOTONE CUBIC SPLINE
+// Guarantees monotonicity and non-negative forward rates.
+// Fitted on (t, ln DF) — equivalent to fitting on CC zero rates
+// but keeps the forward rate positive by construction.
+//
+// Algorithm:
+//   1. Compute initial Fritsch-Carlson slopes at each node
+//   2. Apply Hyman monotonicity filter to clamp slopes
+//   3. Use Hermite cubic interpolation between nodes
+//   4. Extrapolate flat-forward beyond the last node
 // ================================================================
-function buildCubicSpline(xs, ys) {
+function buildHymanSpline(xs, ys) {
+  // ys is ln(DF) array — negative and monotone decreasing
   const n = xs.length;
   if (n < 2) return null;
-  // Set up tridiagonal system for natural cubic spline (M[0]=M[n-1]=0)
-  const h = [], alpha = [], l = [], mu = [], z = [], c = [], b = [], d = [];
-  for (let i = 0; i < n - 1; i++) h[i] = xs[i + 1] - xs[i];
-  for (let i = 1; i < n - 1; i++)
-    alpha[i] = (3 / h[i]) * (ys[i + 1] - ys[i]) - (3 / h[i - 1]) * (ys[i] - ys[i - 1]);
-  l[0] = 1; mu[0] = 0; z[0] = 0;
-  for (let i = 1; i < n - 1; i++) {
-    l[i] = 2 * (xs[i + 1] - xs[i - 1]) - h[i - 1] * mu[i - 1];
-    mu[i] = h[i] / l[i];
-    z[i] = (alpha[i] - h[i - 1] * z[i - 1]) / l[i];
+
+  const h  = new Array(n-1);
+  const dy = new Array(n-1);
+  for (let i = 0; i < n-1; i++) {
+    h[i]  = xs[i+1] - xs[i];
+    dy[i] = (ys[i+1] - ys[i]) / h[i];   // chord slope
   }
-  l[n - 1] = 1; z[n - 1] = 0; c[n - 1] = 0;
-  for (let j = n - 2; j >= 0; j--) {
-    c[j] = z[j] - mu[j] * c[j + 1];
-    b[j] = (ys[j + 1] - ys[j]) / h[j] - h[j] * (c[j + 1] + 2 * c[j]) / 3;
-    d[j] = (c[j + 1] - c[j]) / (3 * h[j]);
+
+  // Initialise tangents with Fritsch-Carlson centred differences
+  const m = new Array(n);
+  m[0]   = dy[0];
+  m[n-1] = dy[n-2];
+  for (let i = 1; i < n-1; i++) {
+    m[i] = (dy[i-1] + dy[i]) / 2;
   }
-  return { xs, ys, h, b, c, d, n };
+
+  // Hyman monotonicity filter — clamp each tangent so the
+  // Hermite cubic stays monotone in every interval
+  for (let i = 0; i < n-1; i++) {
+    if (Math.abs(dy[i]) < 1e-14) {
+      m[i] = 0; m[i+1] = 0;
+    } else {
+      const alpha = m[i]   / dy[i];
+      const beta  = m[i+1] / dy[i];
+      const r     = alpha*alpha + beta*beta;
+      if (r > 9) {
+        const tau = 3 / Math.sqrt(r);
+        m[i]   = tau * alpha * dy[i];
+        m[i+1] = tau * beta  * dy[i];
+      }
+    }
+  }
+
+  // Precompute Hermite coefficients for each segment
+  // p(u) = h00·y0 + h10·m0 + h01·y1 + h11·m1   where u=(t-t0)/h
+  const c = new Array(n-1);
+  for (let i = 0; i < n-1; i++) {
+    const hi = h[i], y0 = ys[i], y1 = ys[i+1], m0 = m[i], m1 = m[i+1];
+    // Convert to standard cubic ax³+bx²+cx+d with x = t-t0
+    c[i] = {
+      a: (2*y0 - 2*y1 + hi*m0 + hi*m1) / (hi*hi*hi),
+      b: (-3*y0 + 3*y1 - 2*hi*m0 - hi*m1) / (hi*hi),
+      c: m0,
+      d: y0
+    };
+  }
+
+  // Slope at right end (for flat-forward extrapolation)
+  const lastSlope = dy[n-2];   // dy/dt at the last interval = fwd CC rate (positive)
+
+  return { xs, ys, c, n, lastSlope };
 }
 
-function evalCubicSpline(spline, x) {
-  const { xs, ys, b, c, d, n } = spline;
-  // Clamp to range; extrapolate linearly outside
-  if (x <= xs[0]) {
-    // Linear extrapolation from left end using first segment slope
-    return ys[0] + b[0] * (x - xs[0]);
+function evalHymanSpline(spline, t) {
+  const { xs, ys, c, n, lastSlope } = spline;
+  if (t <= xs[0]) {
+    // Left extrapolation: flat forward from first node
+    return ys[0] + c[0].c * (t - xs[0]);
   }
-  if (x >= xs[n - 1]) {
-    // Linear extrapolation from right end using last segment slope
-    const j = n - 2;
-    const dx = xs[n - 1] - xs[j];
-    const slope = b[j] + 2 * c[j] * dx + 3 * d[j] * dx * dx;
-    return ys[n - 1] + slope * (x - xs[n - 1]);
+  if (t >= xs[n-1]) {
+    // Right extrapolation: flat forward at last instantaneous fwd rate
+    return ys[n-1] + lastSlope * (t - xs[n-1]);
   }
-  // Find segment
-  let i = 0;
-  for (let k = 0; k < n - 1; k++) { if (xs[k] <= x && x <= xs[k + 1]) { i = k; break; } }
-  const dx = x - xs[i];
-  return ys[i] + b[i] * dx + c[i] * dx * dx + d[i] * dx * dx * dx;
+  // Binary search for segment
+  let lo = 0, hi = n-2;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (xs[mid] <= t) lo = mid; else hi = mid - 1;
+  }
+  const dx = t - xs[lo];
+  const {a, b, c: cc, d} = c[lo];
+  return a*dx*dx*dx + b*dx*dx + cc*dx + d;
 }
+
+// Convenience: evalHymanSpline returns ln(DF); these convert to usable values
+function hymanDF(spline, t)     { return t <= 0 ? 1.0 : Math.exp(evalHymanSpline(spline, t)); }
+function hymanZero(spline, t)   { return t <= 0 ? 0   : -evalHymanSpline(spline, t) / t; }
 
 // ================================================================
 // FILL MISSING STANDARD TENORS via cubic spline on zero rates
@@ -838,7 +971,6 @@ function evalCubicSpline(spline, x) {
 // Each injected zero gets .interp = 'interpolated' | 'extrapolated'
 // ================================================================
 const ALL_STANDARD_TENORS = [
-  {tenor:'O/N', t:1/365},
   {tenor:'1M',  t:1/12},
   {tenor:'2M',  t:2/12},
   {tenor:'3M',  t:3/12},
@@ -861,42 +993,32 @@ const ALL_STANDARD_TENORS = [
 ];
 
 function fillMissingTenors(zeros) {
-  // Build spline on bootstrapped zero (CC) rates
+  // Build Hyman spline on ln(DF) values from bootstrapped pillars
   const sorted = [...zeros].sort((a, b) => a.t - b.t);
   const xs = sorted.map(z => z.t);
-  const ys = sorted.map(z => z.z);          // continuously-compounded zero rates
-  const spline = buildCubicSpline(xs, ys);
+  const ys = sorted.map(z => Math.log(z.dfVal));   // ln(DF) — monotone decreasing
+  const spline = buildHymanSpline(xs, ys);
   if (!spline) return zeros;
 
   const tMin = xs[0], tMax = xs[xs.length - 1];
-  const existingT = new Set(sorted.map(z => z.t.toFixed(6)));
-
   const result = [...sorted];
 
   ALL_STANDARD_TENORS.forEach(({ tenor, t }) => {
-    // Skip if we already have a bootstrapped point at this t (within tolerance)
     const alreadyHave = sorted.some(z => Math.abs(z.t - t) < 1e-4);
     if (alreadyHave) return;
 
-    // Interpolate / extrapolate zero rate
-    const zCC = evalCubicSpline(spline, t);
-    if (!isFinite(zCC) || zCC <= 0) return;
+    const dfVal = hymanDF(spline, t);
+    if (!isFinite(dfVal) || dfVal <= 0 || dfVal > 1) return;
+    const zCC = -Math.log(dfVal) / t;
 
-    const dfVal = Math.exp(-zCC * t);
-    // Back out an approximate quoted rate (continuous → simple for ≤1Y, semi-ann otherwise)
     let quotedRate, type;
     if (t <= 1.0) {
-      // Simple: DF = 1/(1+r*t) → r = (1/DF - 1)/t
       quotedRate = (1 / dfVal - 1) / t;
       type = 'simple';
     } else {
-      // Semi-annual coupon rate from DF: approximate par rate
-      // We use the spline df for coupon dates
+      // Par rate: back out semi-annual coupon using Hyman DFs for coupon dates
       let annuity = 0;
-      for (let d = 0.5; d < t - 1e-9; d += 0.5) {
-        const zd = evalCubicSpline(spline, d);
-        annuity += Math.exp(-zd * d);
-      }
+      for (let d = 0.5; d < t - 1e-9; d += 0.5) annuity += hymanDF(spline, d);
       quotedRate = (1 - dfVal) / (annuity + dfVal) * 2;
       type = 'semiannual';
     }
@@ -910,47 +1032,51 @@ function fillMissingTenors(zeros) {
 }
 
 // ================================================================
-// BUILD CURVE TOOLS FROM BOOTSTRAPPED ZEROS
+// BUILD CURVE TOOLS — Hyman spline on ln(DF)
+// All DF, zero-rate, and forward-rate queries go through the
+// monotone spline, guaranteeing non-negative instantaneous fwd rates
 // ================================================================
 function buildCurveTools(zeros) {
+  // Fit Hyman spline on ln(DF) at bootstrapped pillars
+  const sorted = [...zeros].sort((a,b) => a.t - b.t);
+  const xs = sorted.map(z => z.t);
+  const ys = sorted.map(z => Math.log(z.dfVal));
+  const spline = buildHymanSpline(xs, ys);
+
   function df(t) {
     if (t <= 0) return 1.0;
-    const n = zeros.length;
-    if (t <= zeros[0].t) return Math.exp(-zeros[0].z * t);
-    if (t >= zeros[n-1].t) return Math.exp(-zeros[n-1].z * t);
-    for (let i = 0; i < n-1; i++) {
-      if (zeros[i].t <= t && zeros[i+1].t >= t) {
-        const {t:t0,z:z0} = zeros[i], {t:t1,z:z1} = zeros[i+1];
-        return Math.exp(-(z0+(z1-z0)*(t-t0)/(t1-t0))*t);
+    if (!spline) {
+      // Fallback: log-linear between pillars
+      if (t <= sorted[0].t) return Math.exp(-sorted[0].z * t);
+      const n = sorted.length;
+      if (t >= sorted[n-1].t) return Math.exp(-sorted[n-1].z * t);
+      for (let i = 0; i < n-1; i++) {
+        if (sorted[i].t <= t && sorted[i+1].t >= t) {
+          const lnDF = Math.log(sorted[i].dfVal) +
+            (Math.log(sorted[i+1].dfVal) - Math.log(sorted[i].dfVal)) *
+            (t - sorted[i].t) / (sorted[i+1].t - sorted[i].t);
+          return Math.exp(lnDF);
+        }
       }
     }
-    return Math.exp(-zeros[n-1].z * t);
+    return hymanDF(spline, t);
   }
 
-  // Zero rate at t (for display)
   function zeroRate(t) {
-    if (t <= 0) return zeros[0].z;
-    const n = zeros.length;
-    if (t <= zeros[0].t) return zeros[0].z;
-    if (t >= zeros[n-1].t) return zeros[n-1].z;
-    for (let i = 0; i < n-1; i++) {
-      if (zeros[i].t <= t && zeros[i+1].t >= t) {
-        const {t:t0,z:z0} = zeros[i], {t:t1,z:z1} = zeros[i+1];
-        return z0 + (z1-z0)*(t-t0)/(t1-t0);
-      }
-    }
-    return zeros[n-1].z;
+    if (t <= 0) return sorted[0] ? sorted[0].z : 0;
+    return hymanZero(spline, t);
   }
 
-  // Annualised simple forward rate for [t1, t2]
-  // f = (DF(t1)/DF(t2) - 1) / (t2-t1)
+  // Annualised simple forward rate for period [t1, t2]
+  // f(t1,t2) = (DF(t1)/DF(t2) − 1) / (t2−t1)
+  // With the Hyman spline on ln(DF), this is guaranteed ≥ 0
   function fwdSimple(t1, t2) {
     const dt = t2 - t1;
-    if (dt < 1e-10) return zeroRate(Math.max(t1,0));
-    const df1 = df(Math.max(t1,0));
+    if (dt < 1e-10) return zeroRate(Math.max(t1, 0));
+    const df1 = df(Math.max(t1, 0));
     const df2 = df(t2);
     if (df2 < 1e-12) return 0;
-    return (df1/df2 - 1) / dt;
+    return (df1 / df2 - 1) / dt;
   }
 
   return { df, zeroRate, fwdSimple, zeros };
@@ -1292,7 +1418,10 @@ function interpolateQuotedRates(knownQuotes) {
   const xs = known.map(q => q.t);
   const ys = known.map(q => q.r);
 
-  const spline = buildCubicSpline(xs, ys);
+  // Use Hyman spline on the quoted swap rates directly
+  // (swap rates are not monotone like DFs, so we use the rate space here,
+  //  not ln(DF) — Hyman still prevents oscillations)
+  const spline = buildHymanSpline(xs, ys);
   const tMin = xs[0], tMax = xs[xs.length - 1];
   const knownTenorSet = new Set(known.map(q => q.tenor));
 
@@ -1300,15 +1429,17 @@ function interpolateQuotedRates(knownQuotes) {
     if (knownTenorSet.has(meta.tenor)) {
       return { ...known.find(q => q.tenor === meta.tenor) };
     }
-    let rate = spline
-      ? evalCubicSpline(spline, meta.t)
-      : (() => {
-          const lo = known.filter(q => q.t <= meta.t).pop();
-          const hi = known.find(q => q.t >= meta.t);
-          if (lo && hi && lo !== hi)
-            return lo.r + (hi.r - lo.r) * (meta.t - lo.t) / (hi.t - lo.t);
-          return (lo || hi).r;
-        })();
+    let rate;
+    if (spline) {
+      rate = evalHymanSpline(spline, meta.t);
+    } else {
+      const lo = known.filter(q => q.t <= meta.t).pop();
+      const hi = known.find(q => q.t >= meta.t);
+      if (lo && hi && lo !== hi)
+        rate = lo.r + (hi.r - lo.r) * (meta.t - lo.t) / (hi.t - lo.t);
+      else
+        rate = (lo || hi).r;
+    }
     rate = Math.max(0.001, Math.min(0.30, rate));
     const kind = (meta.t < tMin || meta.t > tMax) ? 'extrapolated' : 'interpolated';
     return { tenor: meta.tenor, t: meta.t, r: rate, type: meta.type, interp: kind };
@@ -1454,9 +1585,8 @@ function applyLiveFetchedRates() {
   // Step 2 — fill any missing standard tenors via cubic spline interp/extrap
   const fullTwelve = interpolateQuotedRates(knownQuotes);
 
-  // Step 3 — prepend O/N from fallback (never traded on CCIL OIS screen)
-  const onFallback = FALLBACK_QUOTES.find(q => q.tenor === 'O/N');
-  const fullCurve = [onFallback, ...fullTwelve].filter(Boolean);
+  // Step 3 — use fullTwelve directly (O/N removed; curve starts at 1M)
+  const fullCurve = [...fullTwelve].filter(Boolean);
 
   // Step 4 — update preview table to show interpolated/extrapolated rows clearly
   const tbody = document.getElementById('liveFetchTbody');
@@ -1494,8 +1624,9 @@ function applyLiveFetchedRates() {
 
 // Auto-fetch on page load
 window.addEventListener('load', () => {
-  // Silently fetch in background without opening panel
+  // Fetch live repo rate and curve in parallel
   setStatus('fetching');
+  fetchRepoRate(); // updates REPO_RATE in background; non-blocking
   setTimeout(async () => {
     await fetchLiveCurve();
     if (_liveFetchedRates) {
@@ -1701,7 +1832,6 @@ function buildManualCurveFromUI() {
     const tenor = tr.dataset.tenor;
     const t     = parseFloat(tr.dataset.t);
     const type  = tr.dataset.type;
-    if (tenor === 'O/N') return; // O/N handled separately
     const input = tr.querySelector('input[type="number"]');
     if (!input) return;
     const val = parseFloat(input.value);
@@ -1722,8 +1852,7 @@ function applyManualCurve() {
 
   // Fill any missing standard tenors via cubic spline
   const fullTwelve = interpolateQuotedRates(known);
-  const onFallback = FALLBACK_QUOTES.find(q => q.tenor === 'O/N');
-  oisQuotes = [onFallback, ...fullTwelve].filter(Boolean);
+  oisQuotes = [...fullTwelve].filter(Boolean);
 
   // Reflect interpolated values back into the input cells (visual feedback)
   fullTwelve.forEach(q => {
@@ -1766,23 +1895,24 @@ function toggleManualPanel() {
     tr.dataset.tenor  = q.tenor;
     tr.dataset.t      = q.t;
     tr.dataset.type   = q.type;
+
     tr.dataset.source = 'fallback'; // fallback | live | interpolated | extrapolated | manual
-    tr.innerHTML = `
-      <td style="padding:5px 8px;color:var(--text);font-size:12px;font-family:var(--mono)">${q.tenor}</td>
-      <td style="padding:5px 8px;text-align:right;">
-        <input type="number" value="${(q.r*100).toFixed(5)}" step="0.00001" min="0.1" max="30"
-          style="background:var(--bg3);border:1px solid var(--border);color:var(--amber2);
-                 font-family:var(--mono);font-size:12px;padding:3px 6px;border-radius:3px;
-                 width:90px;text-align:right;outline:none;"
-          onfocus="this.style.borderColor='var(--amber)'"
-          onblur="this.style.borderColor='var(--border)'"
-          oninput="markManualEdit(this)">
-        <span style="color:var(--text3);font-size:10px;margin-left:2px">%</span>
-      </td>
-      <td style="padding:5px 8px;" class="manual-source-badge">
-        <span style="font-size:9px;font-family:var(--mono);color:var(--text3);">FALLBACK</span>
-      </td>
-    `;
+      tr.innerHTML = `
+        <td style="padding:5px 8px;color:var(--text);font-size:12px;font-family:var(--mono)">${q.tenor}</td>
+        <td style="padding:5px 8px;text-align:right;">
+          <input type="number" value="${(q.r*100).toFixed(5)}" step="0.00001" min="0.1" max="30"
+            style="background:var(--bg3);border:1px solid var(--border);color:var(--amber2);
+                   font-family:var(--mono);font-size:12px;padding:3px 6px;border-radius:3px;
+                   width:90px;text-align:right;outline:none;"
+            onfocus="this.style.borderColor='var(--amber)'"
+            onblur="this.style.borderColor='var(--border)'"
+            oninput="markManualEdit(this)">
+          <span style="color:var(--text3);font-size:10px;margin-left:2px">%</span>
+        </td>
+        <td style="padding:5px 8px;" class="manual-source-badge">
+          <span style="font-size:9px;font-family:var(--mono);color:var(--text3);">FALLBACK</span>
+        </td>
+      `;
     tbody.appendChild(tr);
   });
 })();
@@ -1822,35 +1952,128 @@ function setManualRowBadge(tenor, source) {
     }
   });
 }
+// ================================================================
+// INR HOLIDAY CALENDAR — Mumbai / National holidays
+// Format: "YYYY-MM-DD"
+// Covers 2024-2035; update as RBI publishes new schedules.
+// Source: RBI annual holiday list + NSE/SEBI Muhurat closures
+// ================================================================
+const INR_HOLIDAYS = new Set([
+  // 2024
+  "2024-01-22","2024-01-26","2024-03-08","2024-03-25","2024-03-29",
+  "2024-04-11","2024-04-14","2024-04-17","2024-04-21","2024-05-01",
+  "2024-05-23","2024-06-17","2024-07-17","2024-08-15","2024-10-02",
+  "2024-10-13","2024-10-14","2024-11-01","2024-11-15","2024-12-25",
+  // 2025
+  "2025-01-26","2025-02-26","2025-03-14","2025-03-31","2025-04-10",
+  "2025-04-14","2025-04-18","2025-04-21","2025-05-01","2025-06-07",
+  "2025-07-06","2025-08-15","2025-08-27","2025-10-02","2025-10-02",
+  "2025-10-20","2025-10-21","2025-11-05","2025-12-25",
+  // 2026
+  "2026-01-26","2026-02-18","2026-03-20","2026-03-30","2026-04-02",
+  "2026-04-06","2026-04-14","2026-05-01","2026-05-27","2026-07-01",
+  "2026-08-15","2026-08-26","2026-10-02","2026-10-08","2026-10-20",
+  "2026-11-11","2026-12-25",
+  // 2027
+  "2027-01-26","2027-03-09","2027-03-19","2027-03-22","2027-03-26",
+  "2027-04-14","2027-05-01","2027-06-21","2027-08-15","2027-08-16",
+  "2027-10-02","2027-10-19","2027-11-01","2027-12-25",
+  // 2028
+  "2028-01-26","2028-02-28","2028-03-06","2028-03-14","2028-04-06",
+  "2028-04-14","2028-05-01","2028-06-09","2028-08-15","2028-10-02",
+  "2028-10-17","2028-11-20","2028-12-25",
+  // 2029–2035 (fixed national holidays only; floating festivals approximate)
+  "2029-01-26","2029-04-14","2029-05-01","2029-08-15","2029-10-02","2029-12-25",
+  "2030-01-26","2030-04-14","2030-05-01","2030-08-15","2030-10-02","2030-12-25",
+  "2031-01-26","2031-04-14","2031-05-01","2031-08-15","2031-10-02","2031-12-25",
+  "2032-01-26","2032-04-14","2032-05-01","2032-08-15","2032-10-02","2032-12-25",
+  "2033-01-26","2033-04-14","2033-05-01","2033-08-15","2033-10-02","2033-12-25",
+  "2034-01-26","2034-04-14","2034-05-01","2034-08-15","2034-10-02","2034-12-25",
+  "2035-01-26","2035-04-14","2035-05-01","2035-08-15","2035-10-02","2035-12-25",
+]);
+
+function isWeekend(d) { const wd = d.getDay(); return wd === 0 || wd === 6; }
+function isHoliday(d) { return INR_HOLIDAYS.has(d.toISOString().slice(0,10)); }
+function isGoodBusinessDay(d) { return !isWeekend(d) && !isHoliday(d); }
+
+// Modified Following: advance to next business day;
+// if that crosses into the next month, go back to previous business day instead.
+function modifiedFollowing(d) {
+  const orig = new Date(d);
+  let adj = new Date(d);
+  // Step forward
+  while (!isGoodBusinessDay(adj)) {
+    adj.setDate(adj.getDate() + 1);
+  }
+  // If we crossed a month boundary, step backward from original instead
+  if (adj.getMonth() !== orig.getMonth()) {
+    adj = new Date(orig);
+    while (!isGoodBusinessDay(adj)) {
+      adj.setDate(adj.getDate() - 1);
+    }
+  }
+  return adj;
+}
+
+// End-of-Month rule: if the unadjusted date falls on the last calendar day
+// of a month, always land on the last business day of the adjusted month.
 function addMonths(date, months) {
   const d = new Date(date);
-  const day = d.getDate();
-  d.setMonth(d.getMonth()+months);
-  if (d.getDate()<day) d.setDate(0);
+  const origDay = d.getDate();
+  const daysInOrigMonth = new Date(d.getFullYear(), d.getMonth()+1, 0).getDate();
+  const eom = origDay === daysInOrigMonth;   // end-of-month flag
+
+  d.setMonth(d.getMonth() + months);
+  if (eom) {
+    // Roll to last calendar day of target month
+    d.setDate(new Date(d.getFullYear(), d.getMonth()+1, 0).getDate());
+  } else if (d.getDate() < origDay) {
+    // setMonth overshot (e.g. Jan 31 + 1M → Feb 28/29)
+    d.setDate(0);
+  }
   return d;
 }
+
 function daysBetween(d1,d2) { return Math.round((d2-d1)/86400000); }
 function freqToMonths(f) { return {monthly:1,quarterly:3,semiannual:6,annual:12,bullet:0}[f]; }
 function fmtDate(d) { return d.toISOString().slice(0,10); }
 
 // ================================================================
-// DATE SERIES GENERATORS
+// DATE SERIES GENERATORS — with Modified Following adjustment
+// Payment dates are business-day-adjusted; maturity date is
+// NOT adjusted (it is the contractual date as entered).
 // ================================================================
 function genDates(start, end, freqM) {
-  const dates=[];
-  let cur=addMonths(start,freqM);
-  while(cur.getTime()<end.getTime()){dates.push(new Date(cur));cur=addMonths(cur,freqM);}
-  dates.push(new Date(end));
-  const seen=new Set();
-  return dates.filter(d=>{const k=d.getTime();if(seen.has(k))return false;seen.add(k);return true;});
+  const dates = [];
+  let cur = addMonths(start, freqM);
+  while (cur.getTime() < end.getTime()) {
+    dates.push(modifiedFollowing(new Date(cur)));
+    cur = addMonths(cur, freqM);
+  }
+  dates.push(new Date(end));   // maturity: keep as-is (contractual)
+  const seen = new Set();
+  return dates.filter(d => {
+    const k = d.getTime();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
 }
 function genPrinDates(moraEnd, end, freqM) {
-  const dates=[];
-  let cur=addMonths(moraEnd,freqM);
-  while(cur.getTime()<end.getTime()){dates.push(new Date(cur));cur=addMonths(cur,freqM);}
+  const dates = [];
+  let cur = addMonths(moraEnd, freqM);
+  while (cur.getTime() < end.getTime()) {
+    dates.push(modifiedFollowing(new Date(cur)));
+    cur = addMonths(cur, freqM);
+  }
   dates.push(new Date(end));
-  const seen=new Set();
-  return dates.filter(d=>{const k=d.getTime();if(seen.has(k))return false;seen.add(k);return true;});
+  const seen = new Set();
+  return dates.filter(d => {
+    const k = d.getTime();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
 }
 
 // ================================================================
@@ -2055,6 +2278,97 @@ function computePV01(params, zeros, ct) {
     .reduce((s, r) => s + r.outstanding * (r.days / 365) * r.df, 0);
   return annuity * 0.0001;  // 1 bp = 0.0001
 }
+
+// ================================================================
+// YIELD SENSITIVITY TABLE
+// Re-bootstraps the OIS curve with a parallel shift of ±N bps,
+// reprices both legs and shows: PV Fixed, PV Float, Swap Value,
+// and ΔSwap Value vs the base (unshifted) curve.
+// Swap Value = PV Float − PV Fixed  (positive = fixed receiver wins)
+// ================================================================
+const YIELD_SENS_SHIFTS = [-200, -100, -50, -25, 0, +25, +50, +100, +200];
+
+function bumpOisQuotes(quotes, shiftBps) {
+  return quotes.map(q => ({ ...q, r: Math.max(0.0001, q.r + shiftBps / 10000) }));
+}
+
+function computeAndRenderYieldSens(params, baseFixedRate, baseSpread) {
+  const tbody = document.getElementById('yieldSensTbody');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+
+  const fmtINR = v => {
+    const sign = v < 0 ? '−' : '+';
+    return sign + '₹\u00a0' + new Intl.NumberFormat('en-IN', {maximumFractionDigits: 0}).format(Math.round(Math.abs(v)));
+  };
+
+  // Compute swap value from CLIENT perspective:
+  // Spread mode: client receives fixed → value = pvFixed - pvFloat
+  //   (yields up → pvFixed falls → negative for client ✓)
+  // Fixed rate mode: client pays fixed → value = pvFloat - pvFixed
+  //   (yields up → pvFloat falls less → positive for client ✓)
+  // solveMode is captured from outer scope
+  function swapValue(ct) {
+    const rows  = buildSchedule({...params, fixedRate: baseFixedRate, spread: baseSpread}, ct);
+    const pvFix = pv(rows, false);
+    const pvFlt = pv(rows, true);
+    return solveMode === 'spread'
+      ? pvFix - pvFlt   // client receives fixed
+      : pvFlt - pvFix;  // client pays fixed
+  }
+
+  // Base (unshifted) swap value
+  const baseBoot  = bootstrapZeroCurve(oisQuotes);
+  const baseZeros = fillMissingTenors(baseBoot);
+  const baseCt    = buildCurveTools(baseZeros);
+  const baseVal   = swapValue(baseCt);
+
+  YIELD_SENS_SHIFTS.forEach(shift => {
+    const isBase = shift === 0;
+    let val;
+
+    try {
+      if (isBase) {
+        val = baseVal;
+      } else {
+        const bumped = bumpOisQuotes(oisQuotes, shift);
+        const boot   = bootstrapZeroCurve(bumped);
+        const zeros  = fillMissingTenors(boot);
+        const ct     = buildCurveTools(zeros);
+        val = swapValue(ct);
+      }
+    } catch(e) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td colspan="5" style="color:var(--red);font-family:var(--mono);font-size:11px;padding:6px 8px;">
+        Error at ${shift > 0 ? '+' : ''}${shift} bps: ${e.message}</td>`;
+      tbody.appendChild(tr);
+      return;
+    }
+
+    // Shift label
+    let shiftLabel;
+    if (isBase) {
+      shiftLabel = '<span style="color:var(--amber2);font-weight:600;font-family:var(--mono)">BASE (0)</span>';
+    } else if (shift > 0) {
+      shiftLabel = `<span style="color:var(--red);font-family:var(--mono)">+${shift} bps ↑</span>`;
+    } else {
+      shiftLabel = `<span style="color:var(--green);font-family:var(--mono)">${shift} bps ↓</span>`;
+    }
+
+    const valColor = isBase ? 'var(--text2)' : (val >= 0 ? 'var(--green)' : 'var(--red)');
+    const valFmt   = fmtINR(val);
+
+    const tr = document.createElement('tr');
+    tr.setAttribute('style', isBase ? 'background:rgba(245,166,35,.06);' : '');
+    tr.innerHTML = `
+      <td style="padding:6px 8px;">${shiftLabel}</td>
+      <td class="td-num" style="color:${valColor};font-family:var(--mono);font-size:12px;font-weight:600;padding:6px 8px;">${valFmt}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  document.getElementById('yieldSensCard').className = 'card show';
+}
 function solveSpread(params, ct) {
   let a=-500, b=1500;
   function obj(s) {
@@ -2164,6 +2478,7 @@ function renderCurveTable(zeros, ct, dealTenor) {
 // RENDER CF TABLE
 // ================================================================
 function renderCFTable(rows) {
+  window._lastCFRows = rows; // store for Excel export
   const tbody=document.getElementById('cfTbody');
   tbody.innerHTML='';
   rows.forEach(r=>{
@@ -2181,6 +2496,76 @@ function renderCFTable(rows) {
     `;
     tbody.appendChild(tr);
   });
+}
+
+// ================================================================
+// EXPORT CASH FLOW SCHEDULE TO EXCEL
+// ================================================================
+function exportCFtoExcel() {
+  if (typeof XLSX === 'undefined') {
+    alert('SheetJS not loaded yet — please try again in a moment.');
+    return;
+  }
+
+  // Collect rows from the stored schedule (use global _lastCFRows)
+  if (!window._lastCFRows || window._lastCFRows.length === 0) {
+    alert('No cash flow data to export. Please price a deal first.');
+    return;
+  }
+
+  const rows = window._lastCFRows;
+
+  // Build data array — headers match the on-screen table (user-requested columns only)
+  const headers = [
+    'Date',
+    'O/S Principal (₹)',
+    'Princ. Pmt (₹)',
+    'Fixed Interest (₹)',
+    'Fwd MIBOR (%)',
+    'Float Interest (₹)'
+  ];
+
+  const data = [headers];
+  rows.forEach(r => {
+    data.push([
+      fmtDate(r.date),
+      Math.round(r.outstanding),
+      Math.round(r.principalPmt),
+      parseFloat(r.fixedInt.toFixed(2)),
+      r.fwdRate > 0 ? parseFloat((r.fwdRate * 100).toFixed(4)) : '',
+      parseFloat(r.floatInt.toFixed(2))
+    ]);
+  });
+
+  const ws = XLSX.utils.aoa_to_sheet(data);
+
+  // Column widths
+  ws['!cols'] = [
+    { wch: 14 }, // Date
+    { wch: 20 }, // O/S Principal
+    { wch: 16 }, // Princ. Pmt
+    { wch: 20 }, // Fixed Interest
+    { wch: 16 }, // Fwd MIBOR
+    { wch: 20 }, // Float Interest
+  ];
+
+  // Style header row bold (basic cell metadata)
+  headers.forEach((_, ci) => {
+    const cellAddr = XLSX.utils.encode_cell({ r: 0, c: ci });
+    if (ws[cellAddr]) {
+      ws[cellAddr].s = { font: { bold: true } };
+    }
+  });
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Cash Flow Schedule');
+
+  // Filename: IRS_CF_<startDate>_<matDate>.xlsx
+  const startEl = document.getElementById('startDateHidden').value || 'start';
+  const matEl   = document.getElementById('maturityDateHidden').value || 'mat';
+  const fname   = `IRS_CF_${startEl}_${matEl}.xlsx`;
+
+  XLSX.writeFile(wb, fname);
 }
 
 // ================================================================
@@ -2213,6 +2598,75 @@ function renderChart(rows) {
     }
   });
 }
+
+// ================================================================
+// NOTIONAL INPUT — supports commas, Cr/L/K shorthand
+// ================================================================
+function parseNotionalRaw(raw) {
+  if (!raw) return NaN;
+  const s = raw.trim().replace(/,/g, '');
+  // Match number + optional suffix: Cr/cr/CR, L/l/lac/lakh, K/k
+  const m = s.match(/^([\d.]+)\s*(cr|crore|l|lac|lakh|k|thousand)?$/i);
+  if (!m) return NaN;
+  const num = parseFloat(m[1]);
+  const suffix = (m[2] || '').toLowerCase();
+  if (suffix === 'cr' || suffix === 'crore') return Math.round(num * 1e7);
+  if (suffix === 'l' || suffix === 'lac' || suffix === 'lakh') return Math.round(num * 1e5);
+  if (suffix === 'k' || suffix === 'thousand') return Math.round(num * 1e3);
+  return Math.round(num);
+}
+
+function fmtNotionalUnit(val) {
+  if (!isFinite(val) || val <= 0) return '';
+  if (val >= 1e7)  return '= ₹ ' + (val/1e7).toFixed(2) + ' Cr';
+  if (val >= 1e5)  return '= ₹ ' + (val/1e5).toFixed(2) + ' L';
+  return '= ₹ ' + new Intl.NumberFormat('en-IN').format(val);
+}
+
+function parseNotionalInput(el) {
+  const val = parseNotionalRaw(el.value);
+  const hidden = document.getElementById('notional');
+  const unit   = document.getElementById('notionalUnit');
+  if (isFinite(val) && val > 0) {
+    hidden.value = val;
+    el.style.borderColor = 'var(--amber)';
+    if (unit) unit.textContent = fmtNotionalUnit(val);
+  } else {
+    hidden.value = '';
+    el.style.borderColor = 'rgba(255,95,95,.6)';
+    if (unit) unit.textContent = 'invalid';
+  }
+}
+
+function formatNotionalDisplay(el) {
+  const val = parseNotionalRaw(el.value);
+  if (isFinite(val) && val > 0) {
+    // Format with Indian comma grouping
+    el.value = new Intl.NumberFormat('en-IN').format(val);
+    el.style.borderColor = 'var(--border)';
+    document.getElementById('notional').value = val;
+    const unit = document.getElementById('notionalUnit');
+    if (unit) unit.textContent = fmtNotionalUnit(val);
+  }
+}
+
+// ================================================================
+// AVG MATURITY (principal-weighted average time to repayment)
+// ================================================================
+function computeAvgMaturity(rows, startDate) {
+  const sd = new Date(startDate);
+  let sumWT = 0, sumP = 0;
+  rows.forEach(r => {
+    if (r.principalPmt > 0) {
+      const t = (r.date - sd) / (365.25 * 24 * 3600 * 1000);
+      sumWT += r.principalPmt * t;
+      sumP  += r.principalPmt;
+    }
+  });
+  return sumP > 0 ? sumWT / sumP : 0;
+}
+
+
 
 // ================================================================
 // MAIN PRICER
@@ -2290,7 +2744,7 @@ async function runPricer() {
     const ct    = buildCurveTools(zeros);
     const tenor = daysBetween(sd,md)/365;
 
-    let spread, fixedRate, rows, pvFixed, pvFloat, mtm, parRate;
+    let spread, fixedRate, rows, pvFixed, pvFloat, parRate;
 
     if (solveMode === 'spread') {
       // ── MODE A: solve for spread given fixed rate ──
@@ -2303,7 +2757,6 @@ async function runPricer() {
       rows    = buildSchedule({...params, spread}, ct);
       pvFixed = pv(rows, false);
       pvFloat = pv(rows, true);
-      mtm     = pvFloat - pvFixed;
       parRate = computeParRate(params, ct);
 
       // Update hero
@@ -2313,7 +2766,7 @@ async function runPricer() {
       document.getElementById('spreadBps').innerHTML = `${spread.toFixed(2)}<span>bps</span>`;
       document.getElementById('fixedRateResult').style.display = 'none';
       document.getElementById('spreadDecomp').innerHTML =
-        `<span class="fwd">Client Pays:</span> O/N MIBOR <span class="accent">${spreadSign}${Math.abs(spread).toFixed(2)} bps</span>`+
+        `<span class="fwd">Client Pays:</span> MIBOR/MIOIS <span class="accent">${spreadSign}${Math.abs(spread).toFixed(2)} bps</span>`+
         `&nbsp;&nbsp;|&nbsp;&nbsp;<span class="fwd">Client Receives:</span> <span class="hi">${fixedRate.toFixed(3)}% fixed</span>`;
 
       // Update metric labels back to spread-mode
@@ -2337,7 +2790,6 @@ async function runPricer() {
       rows    = buildSchedule(finalParams, ct);
       pvFixed = pv(rows, false);
       pvFloat = pv(rows, true);
-      mtm     = pvFloat - pvFixed;
       parRate = computeParRate({...finalParams, spread:0}, ct);
 
       const spreadSign = spread>=0?'+':'';
@@ -2347,7 +2799,7 @@ async function runPricer() {
       document.getElementById('fixedRateBig').innerHTML = `${fixedRate.toFixed(5)}<span>%</span>`;
       document.getElementById('spreadDecomp').innerHTML =
         `<span class="fwd">Client Pays:</span> <span class="hi">${fixedRate.toFixed(3)}% fixed</span>`+
-        `&nbsp;&nbsp;|&nbsp;&nbsp;<span class="fwd">Client Receives:</span> O/N MIBOR <span class="accent">${spreadSign}${Math.abs(spread).toFixed(2)} bps</span>`;
+        `&nbsp;&nbsp;|&nbsp;&nbsp;<span class="fwd">Client Receives:</span> MIBOR/MIOIS <span class="accent">${spreadSign}${Math.abs(spread).toFixed(2)} bps</span>`;
 
       // Relabel metric cards for this mode
       document.querySelector('#mParRate').closest('.metric-card').querySelector('.metric-name').textContent = 'Par Swap Rate';
@@ -2359,9 +2811,6 @@ async function runPricer() {
     // ── Shared metrics ──
     document.getElementById('mPvFixed').textContent=fmtCr(pvFixed);
     document.getElementById('mPvFloat').textContent=fmtCr(pvFloat);
-    const mtmEl=document.getElementById('mMtm');
-    mtmEl.textContent=fmtCr(Math.abs(mtm));
-    mtmEl.className='metric-val '+(mtm>=0?'pos':'neg');
     document.getElementById('mTenor').textContent=tenor.toFixed(2);
     document.getElementById('mParRate').textContent=parRate.toFixed(3);
     document.getElementById('mParRate').className='metric-val '+(fixedRate>parRate?'pos':'neg');
@@ -2373,6 +2822,10 @@ async function runPricer() {
                                partialIrs,loanMaturityDate}, zeros, ct);
     const pv01Fmt = new Intl.NumberFormat('en-IN',{maximumFractionDigits:0}).format(Math.round(pv01));
     document.getElementById('mPv01').textContent = '₹ ' + pv01Fmt;
+
+    // Avg Maturity
+    const avgMat = computeAvgMaturity(rows, startDate);
+    document.getElementById('mAvgMat').textContent = avgMat > 0 ? avgMat.toFixed(2) : tenor.toFixed(2);
 
     document.getElementById('metricsRow').style.display='grid';
 
@@ -2400,11 +2853,17 @@ async function runPricer() {
     document.getElementById('curveSource').textContent=isLive?'LIVE ✓':'FALLBACK';
     document.getElementById('curveSource').className=isLive?'tag-live':'tag-fallback';
     document.getElementById('curveCard').className='card show';
-    document.getElementById('chartCard').className='card show';
     document.getElementById('cfCard').className='card show';
     renderCurveTable(zeros,ct,tenor);
-    renderChart(rows);
     renderCFTable(rows);
+
+    // ── Yield Sensitivity Table ──
+    computeAndRenderYieldSens(
+      {startDate, maturityDate, moratoriumMonths:moratorium,
+       notional, principalFreq, amortType, intFreq,
+       partialIrs, loanMaturityDate},
+      fixedRate, spread
+    );
 
   } catch(e) {
     showError('Error: '+e.message);
