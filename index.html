@@ -562,17 +562,13 @@ canvas{width:100%!important;}
         <span>Bootstrapped Zero Curve · Discount Factors · Forward Rates</span>
         <span id="curveSource" class="tag-fallback">FALLBACK</span>
       </div>
-      <div style="font-size:10px;font-family:var(--mono);color:var(--text3);margin-bottom:8px;line-height:1.7;">
-        Rows without a market quote are filled using <strong style="color:var(--purple)">cubic spline interpolation</strong> on bootstrapped zero rates.
-        Points beyond the quoted curve range are <strong style="color:var(--purple)">linearly extrapolated</strong>.
-        &nbsp;|&nbsp; <span class="tag-interp">INTERPOLATED ◈</span> &nbsp; <span style="color:var(--purple);font-size:10px">EXTRAPOLATED ⟿</span>
-      </div>
+
       <div class="table-wrap">
         <table>
           <thead><tr>
             <th>Tenor</th>
             <th class="td-num">Years (t)</th>
-            <th class="td-num">Quoted Swap Rate (%)</th>
+            <th class="td-num">Mid Rate / Pricing Rate (%)</th>
             <th class="td-num">Zero Rate CC (%)</th>
             <th class="td-num" style="color:var(--purple)">DF(t)</th>
             <th class="td-num" style="color:var(--blue2)">Fwd Rate (%)</th>
@@ -617,7 +613,6 @@ canvas{width:100%!important;}
     <div class="card" id="yieldSensCard">
       <div class="card-title">
         <span>Swap Value Sensitivity · Parallel Discount Curve Shift</span>
-        <span style="font-family:var(--mono);font-size:10px;color:var(--text3);letter-spacing:.5px;">ΔPVF − ΔPVX = ΔSwap Value</span>
       </div>
       <div style="font-size:10px;font-family:var(--mono);color:var(--text3);margin-bottom:10px;line-height:1.7;">
         Each row re-bootstraps the full OIS curve shifted ±N bps, then reprices both legs from the <strong style="color:var(--amber2)">client's perspective</strong>. &nbsp;|&nbsp;
@@ -639,6 +634,19 @@ canvas{width:100%!important;}
 
   <!-- ===== METHODOLOGY TAB ===== -->
   <div class="method-content" id="methodTab">
+
+    <div class="method-section">
+      <div class="method-h">Bid / Ask Curve Construction (Bloomberg SWPM Convention)</div>
+      <p class="method-p">Market makers quote swaps at a <strong>bid/ask spread</strong> around the mid OIS curve. This pricer applies ±2 bps to every tenor of the CCIL Wt.Avg.Rate to construct the bid and ask curves:</p>
+      <div class="method-code">Ask Rate (tenor T) = Wt.Avg.Rate(T) + 2 bps  → bootstrapped to Ask Zero/DF curve
+Bid Rate (tenor T) = Wt.Avg.Rate(T) − 2 bps  → bootstrapped to Bid Zero/DF curve</div>
+      <p class="method-p">The pricing curve selected depends on the trade direction — consistent with how Bloomberg SWPM prices OIS-linked swaps:</p>
+      <ul class="method-list">
+        <li><strong>Client Pays Float, Receives Fixed (Solve Spread mode):</strong> Forward rates are derived from the <span style="color:var(--green)">BID curve</span> (mid − 2 bps). Lower forwards → lower float PV → the bisection solver raises the spread the client must pay to equate the legs. Net effect: solved spread is ~+2 bps higher than at mid.</li>
+        <li><strong>Client Pays Fixed, Receives Float (Solve Fixed Rate mode):</strong> Forward rates are derived from the <span style="color:var(--red)">ASK curve</span> (mid + 2 bps). Higher forwards → higher float PV → the solved fixed rate the client pays is higher. Net effect: solved fixed rate is ~+2 bps higher than at mid.</li>
+      </ul>
+      <p class="method-p">In both cases the dealer's bid/ask margin works against the client by ~2 bps. This is the standard market-making convention applied in Bloomberg SWPM and all major dealer systems for INR OIS and IRS instruments.</p>
+    </div>
 
     <div class="method-section">
       <div class="method-h">INR MIBOR OIS Market Conventions</div>
@@ -868,6 +876,46 @@ function bootstrapZeroCurve(quotes) {
     zeros.sort((a,b) => a.t - b.t);
   }
   return zeros;
+}
+
+// ================================================================
+// BID / ASK CURVES — Bloomberg-style ±2 bps spread on mid quotes
+//
+// The key intuition: the discount/forward curve determines the PV of
+// the FLOAT leg (MIBOR forwards). The bank always applies the curve
+// that makes the float leg MORE expensive for the client:
+//
+//   Solve Spread (client pays float, receives fixed):
+//     Bank wants to LOWER float PV → uses BID curve (mid − 2 bps)
+//     Lower forwards → lower float PV → bisection forces a HIGHER spread
+//     the client must pay to equate legs. Client pays more. ✓
+//
+//   Solve Fixed Rate (client pays fixed, receives float):
+//     Bank wants to RAISE float PV → uses ASK curve (mid + 2 bps)
+//     Higher forwards → higher float PV → solved fixed rate is HIGHER.
+//     Client pays more fixed. ✓
+//
+// Net effect: compared to mid-curve valuation, the solved spread is
+// ~+2 bps higher in spread mode, and the solved fixed rate is ~+2 bps
+// higher in fixed-rate mode. This is the dealer's bid/ask margin.
+// ================================================================
+const BID_ASK_HALF_SPREAD_BPS = 2;   // half-spread in bps (so total spread = 4 bps)
+
+function applyBidAskShift(quotes, shiftBps) {
+  // shiftBps: positive = ask (shift up), negative = bid (shift down)
+  return quotes.map(q => ({
+    ...q,
+    r: Math.max(0.0001, q.r + shiftBps / 10000)
+  }));
+}
+
+// Returns { bidQuotes, askQuotes, midQuotes }
+function buildBidAskQuotes(midQuotes) {
+  return {
+    midQuotes,
+    bidQuotes: applyBidAskShift(midQuotes, -BID_ASK_HALF_SPREAD_BPS),
+    askQuotes: applyBidAskShift(midQuotes, +BID_ASK_HALF_SPREAD_BPS),
+  };
 }
 
 // ================================================================
@@ -1615,10 +1663,8 @@ function applyLiveFetchedRates() {
   document.getElementById('manualApplied').style.display = 'block';
 
   // Show how many tenors were interpolated/extrapolated
-  const nInterp = fullTwelve.filter(q => q.interp).length;
-  const interpNote = nInterp > 0 ? ` (${nInterp} tenor${nInterp>1?'s':''} interpolated/extrapolated)` : '';
   document.getElementById('manualAppliedDate').textContent =
-    'Live rates applied ' + new Date().toLocaleString('en-IN') + interpNote;
+    'Live rates applied ' + new Date().toLocaleString('en-IN');
   document.querySelector('.btn-toggle').textContent = 'UPDATE RATES ▾';
 }
 
@@ -1810,8 +1856,7 @@ function processExcelFile(file) {
       // Switch to manual tab so user can review
       switchCurveTab('manual');
       statusEl.style.color = 'var(--green)';
-      const interpMsg = nInterp > 0 ? ` · ${nInterp} missing tenor${nInterp>1?'s':''} interpolated (shown in purple)` : '';
-      statusEl.textContent = `✓ Extracted ${extracted.length} rates from "${file.name}"${interpMsg} — review and click Apply`;
+      statusEl.textContent = `✓ Extracted ${extracted.length} rates from "${file.name}" — review and click Apply`;
 
     } catch(err) {
       statusEl.style.color = 'var(--red)';
@@ -1872,10 +1917,8 @@ function applyManualCurve() {
   setStatus(true);
   document.getElementById('manualPanel').style.display = 'none';
   document.getElementById('manualApplied').style.display = 'block';
-  const nInterp = fullTwelve.filter(q => q.interp).length;
-  const interpNote = nInterp > 0 ? ` (${nInterp} tenor${nInterp>1?'s':''} interpolated/extrapolated)` : '';
   document.getElementById('manualAppliedDate').textContent =
-    'Rates applied ' + new Date().toLocaleString('en-IN') + interpNote;
+    'Rates applied ' + new Date().toLocaleString('en-IN');
 }
 
 function toggleManualPanel() {
@@ -2292,7 +2335,9 @@ function bumpOisQuotes(quotes, shiftBps) {
   return quotes.map(q => ({ ...q, r: Math.max(0.0001, q.r + shiftBps / 10000) }));
 }
 
-function computeAndRenderYieldSens(params, baseFixedRate, baseSpread) {
+function computeAndRenderYieldSens(params, baseFixedRate, baseSpread, pricingQuotes) {
+  // pricingQuotes: the bid or ask shifted quotes used for valuation (passed from runPricer)
+  const quotesForSens = pricingQuotes || oisQuotes;
   const tbody = document.getElementById('yieldSensTbody');
   if (!tbody) return;
   tbody.innerHTML = '';
@@ -2317,8 +2362,8 @@ function computeAndRenderYieldSens(params, baseFixedRate, baseSpread) {
       : pvFlt - pvFix;  // client pays fixed
   }
 
-  // Base (unshifted) swap value
-  const baseBoot  = bootstrapZeroCurve(oisQuotes);
+  // Base (unshifted) swap value — uses bid/ask pricing curve
+  const baseBoot  = bootstrapZeroCurve(quotesForSens);
   const baseZeros = fillMissingTenors(baseBoot);
   const baseCt    = buildCurveTools(baseZeros);
   const baseVal   = swapValue(baseCt);
@@ -2331,7 +2376,8 @@ function computeAndRenderYieldSens(params, baseFixedRate, baseSpread) {
       if (isBase) {
         val = baseVal;
       } else {
-        const bumped = bumpOisQuotes(oisQuotes, shift);
+        // Apply parallel bump ON TOP OF the bid/ask pricing curve
+        const bumped = bumpOisQuotes(quotesForSens, shift);
         const boot   = bootstrapZeroCurve(bumped);
         const zeros  = fillMissingTenors(boot);
         const ct     = buildCurveTools(zeros);
@@ -2430,13 +2476,34 @@ function fmtCr(v) { return fmt2.format(v/1e7); }
 // ================================================================
 // RENDER CURVE TABLE
 // ================================================================
-function renderCurveTable(zeros, ct, dealTenor) {
+function renderCurveTable(zeros, ct, dealTenor, midZeros, curveLabel) {
   const tbody=document.getElementById('curveTbody');
   tbody.innerHTML='';
+
+  // Update column header to reflect bid/ask
+  const headerRow = document.querySelector('#curveCard thead tr');
+  if (headerRow) {
+    const ths = headerRow.querySelectorAll('th');
+    // ths[2] = Quoted Swap Rate — rename to show mid vs pricing curve
+    const bidAskColorHdr = (curveLabel === 'BID') ? 'var(--green)' : 'var(--red)';
+    if (ths[2]) ths[2].innerHTML = `<span style="color:var(--text3)">Mid Rate (%)</span>`;
+    // Insert/update pricing rate column header (ths[3] = Zero Rate)
+    // We'll show mid in the "Quoted" column and pricing-curve rate in a new tooltip
+  }
+
+  // Build a lookup for mid quoted rates by tenor
+  const midByTenor = {};
+  if (midZeros) {
+    midZeros.forEach(z => { midByTenor[z.tenor] = z.quotedRate; });
+  }
+
   const srcLive     = '<span class="tag-live">LIVE ✓</span>';
   const srcFallback = '<span class="tag-fallback">FALLBACK</span>';
   const srcInterp   = '<span class="tag-interp" style="font-size:10px">INTERPOLATED ◈</span>';
   const srcExtrap   = '<span style="color:var(--purple);font-size:10px">EXTRAPOLATED ⟿</span>';
+
+  const bidAskColor = (curveLabel === 'BID') ? 'var(--green)' : 'var(--red)';
+  const bidAskLabel = curveLabel || 'MID';
 
   let closestIdx=0, closestDist=Infinity;
   zeros.forEach((z,i)=>{const d=Math.abs(z.t-dealTenor);if(d<closestDist){closestDist=d;closestIdx=i;}});
@@ -2459,12 +2526,22 @@ function renderCurveTable(zeros, ct, dealTenor) {
     // Dim interpolated/extrapolated rows slightly
     const rowStyle = z.interp ? 'opacity:0.82;' : '';
 
+    // Show mid rate and pricing curve rate side by side
+    const midRate = midByTenor[z.tenor];
+    const midRateStr = (midRate !== undefined)
+      ? `<span style="color:var(--text3);font-size:11px">${(midRate*100).toFixed(5)}</span>`
+      : `<span style="color:var(--text3);font-size:11px">${(z.quotedRate*100).toFixed(5)}</span>`;
+
+    // Pricing-curve rate (bid or ask) in coloured text
+    const pricingRateStr = `<span style="color:${bidAskColor};font-weight:500">${(z.quotedRate*100).toFixed(5)}</span>`+
+      `<span style="color:${bidAskColor};font-size:9px;margin-left:3px">${bidAskLabel}</span>`;
+
     const tr=document.createElement('tr');
     tr.setAttribute('style', rowStyle);
     tr.innerHTML=`
       <td class="td-accent" style="${z.interp?'color:var(--text2)':''}">${z.tenor}</td>
       <td class="td-num">${z.t.toFixed(5)}</td>
-      <td class="td-num ${z.interp?'':'td-accent'}" style="${z.interp?'color:var(--purple)':''}">${(z.quotedRate*100).toFixed(5)}</td>
+      <td class="td-num">${midRateStr}<br>${pricingRateStr}</td>
       <td class="td-num">${(z.z*100).toFixed(5)}</td>
       <td class="td-num" style="color:var(--purple)">${z.dfVal.toFixed(6)}</td>
       <td class="td-num" style="color:var(--blue2)">${fwd.toFixed(5)}</td>
@@ -2739,17 +2816,38 @@ async function runPricer() {
     if(!oisQuotes) { oisQuotes=FALLBACK_QUOTES; setStatus(false); }
 
     btnText.textContent='BOOTSTRAPPING CURVE...';
-    const bootstrapped = bootstrapZeroCurve(oisQuotes);
+
+    // ── Build bid / ask / mid curves ──────────────────────────────────────
+    // Bloomberg convention (see comment above buildBidAskQuotes):
+    //   Solve Spread mode  (client pays float, receives fixed) → BID curve
+    //     Lower forwards → bisection raises spread the client pays
+    //   Solve Fixed Rate mode (client pays fixed, receives float) → ASK curve
+    //     Higher forwards → solved fixed rate that client pays is higher
+    const { bidQuotes, askQuotes, midQuotes } = buildBidAskQuotes(oisQuotes);
+
+    const pricingQuotes = solveMode === 'spread' ? bidQuotes : askQuotes;
+    const curveLabel    = solveMode === 'spread' ? 'BID' : 'ASK';
+    const curveLabelLong = solveMode === 'spread'
+      ? `BID (−${BID_ASK_HALF_SPREAD_BPS} bps under mid)`
+      : `ASK (+${BID_ASK_HALF_SPREAD_BPS} bps over mid)`;
+
+    const bootstrapped = bootstrapZeroCurve(pricingQuotes);
     const zeros = fillMissingTenors(bootstrapped);
     const ct    = buildCurveTools(zeros);
+
+    // Also build mid curve for display reference
+    const midBoot  = bootstrapZeroCurve(midQuotes);
+    const midZeros = fillMissingTenors(midBoot);
+
     const tenor = daysBetween(sd,md)/365;
 
     let spread, fixedRate, rows, pvFixed, pvFloat, parRate;
 
     if (solveMode === 'spread') {
       // ── MODE A: solve for spread given fixed rate ──
+      // Uses ASK curve: dealer offers fixed at ask (mid + 2 bps)
       fixedRate = fixedRateInput;
-      btnText.textContent='SOLVING SPREAD...';
+      btnText.textContent='SOLVING SPREAD (ASK CURVE)...';
       const params = {startDate,maturityDate,moratoriumMonths:moratorium,
                       notional,principalFreq,amortType,intFreq,fixedRate,spread:0,
                       partialIrs, loanMaturityDate};
@@ -2775,8 +2873,9 @@ async function runPricer() {
 
     } else {
       // ── MODE B: solve for fixed rate given spread ──
+      // Uses ASK curve: higher forwards → solved fixed rate the client pays is higher
       spread    = spreadInput_bps;
-      btnText.textContent='SOLVING FIXED RATE...';
+      btnText.textContent='SOLVING FIXED RATE (ASK CURVE)...';
       const params = {startDate,maturityDate,moratoriumMonths:moratorium,
                       notional,principalFreq,amortType,intFreq,fixedRate:1.0,spread,
                       partialIrs, loanMaturityDate};
@@ -2854,15 +2953,16 @@ async function runPricer() {
     document.getElementById('curveSource').className=isLive?'tag-live':'tag-fallback';
     document.getElementById('curveCard').className='card show';
     document.getElementById('cfCard').className='card show';
-    renderCurveTable(zeros,ct,tenor);
+    renderCurveTable(zeros, ct, tenor, midZeros, curveLabel);
     renderCFTable(rows);
 
     // ── Yield Sensitivity Table ──
+    // Sensitivity uses the same bid/ask pricing curve (consistent with valuation)
     computeAndRenderYieldSens(
       {startDate, maturityDate, moratoriumMonths:moratorium,
        notional, principalFreq, amortType, intFreq,
        partialIrs, loanMaturityDate},
-      fixedRate, spread
+      fixedRate, spread, pricingQuotes
     );
 
   } catch(e) {
