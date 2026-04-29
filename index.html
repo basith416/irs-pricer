@@ -2087,11 +2087,16 @@ function fmtDate(d) { return d.toISOString().slice(0,10); }
 // NOT adjusted (it is the contractual date as entered).
 // ================================================================
 function genDates(start, end, freqM) {
+  // KEY FIX: always advance `n` months from the ORIGINAL start date
+  // (unadjusted), then apply Modified Following only for the payment date.
+  // This prevents MF adjustments from causing cumulative drift in the series.
   const dates = [];
-  let cur = addMonths(start, freqM);
-  while (cur.getTime() < end.getTime()) {
-    dates.push(modifiedFollowing(new Date(cur)));
-    cur = addMonths(cur, freqM);
+  let n = 1;
+  while (true) {
+    const unadj = addMonths(start, freqM * n);
+    if (unadj.getTime() >= end.getTime()) break;
+    dates.push(modifiedFollowing(new Date(unadj)));
+    n++;
   }
   dates.push(new Date(end));   // maturity: keep as-is (contractual)
   const seen = new Set();
@@ -2103,11 +2108,15 @@ function genDates(start, end, freqM) {
   });
 }
 function genPrinDates(moraEnd, end, freqM) {
+  // Same fix: anchor each date to moraEnd + n*freqM (unadjusted),
+  // apply MF only for the actual payment date.
   const dates = [];
-  let cur = addMonths(moraEnd, freqM);
-  while (cur.getTime() < end.getTime()) {
-    dates.push(modifiedFollowing(new Date(cur)));
-    cur = addMonths(cur, freqM);
+  let n = 1;
+  while (true) {
+    const unadj = addMonths(moraEnd, freqM * n);
+    if (unadj.getTime() >= end.getTime()) break;
+    dates.push(modifiedFollowing(new Date(unadj)));
+    n++;
   }
   dates.push(new Date(end));
   const seen = new Set();
@@ -2315,10 +2324,15 @@ function computeParRate(params, ct) {
 // ================================================================
 function computePV01(params, zeros, ct) {
   const rows = buildSchedule({...params, spread: 0}, ct);
-  // Annuity = Σ outstanding_i × dcf_i × DF(t_i)  (for interest-bearing periods only)
-  const annuity = rows
-    .filter(r => r.fixedInt > 0)
-    .reduce((s, r) => s + r.outstanding * (r.days / 365) * r.df, 0);
+  // Annuity = Σ outstanding_i × dcf_i × DF(t_i)
+  // Must include ALL periods (moratorium included) — full notional is
+  // rate-sensitive throughout regardless of whether interest was flushed.
+  // Filtering on fixedInt > 0 wrongly excluded moratorium periods,
+  // causing PV01 to fall with more moratorium — completely backwards.
+  const annuity = rows.reduce((s, r) => {
+    if (r.days <= 0) return s;
+    return s + r.outstanding * (r.days / 365) * r.df;
+  }, 0);
   return annuity * 0.0001;  // 1 bp = 0.0001
 }
 
